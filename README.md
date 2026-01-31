@@ -12,9 +12,8 @@ This started as a quick script to speed up initial recon. It grew. Rather than r
 
 ## Installation
 ```bash
-git clone https://github.com/sec0ps/quick_recon.git
+git clone https://github.com/sec0ps/quick_recon.git && sudo apt install python3-requests python3-urllib3 python3-dnspython
 cd quick_recon
-pip install -r requirements.txt
 ```
 
 ## Usage
