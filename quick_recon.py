@@ -449,6 +449,426 @@ class ReconAutomation:
                             else:
                                 self.print_warning(f"✗ {ip} is NOT in provided scope ranges")
 
+    def m365_tenant_attribution(self):
+                """Identify M365/Azure AD tenant attribution and federation posture"""
+                self.print_section("M365/AZURE AD TENANT ATTRIBUTION")
+
+                # Restore from checkpoint if exists
+                resume_data = self.get_resume_data('m365_tenant')
+                progress = resume_data.get('progress', {})
+
+                m365_data = progress.get('m365_data', {
+                    'is_m365': False,
+                    'tenant_id': '',
+                    'tenant_region': '',
+                    'cloud_instance': '',
+                    'namespace_type': '',
+                    'federation_brand': '',
+                    'auth_url': '',
+                    'federation_host': ''
+                })
+
+                # Skip if already complete from checkpoint
+                if progress.get('complete'):
+                    self.print_info("Restored M365 tenant data from checkpoint")
+                    if m365_data.get('is_m365'):
+                        self.print_success(f"Tenant ID: {m365_data['tenant_id']}")
+                    self.results['m365_tenant'] = m365_data
+                    return
+
+                # Endpoint 1: openid-configuration (domain-only, no username required)
+                self.print_info(f"Querying openid-configuration for {self.domain}...")
+
+                try:
+                    url = f"https://login.microsoftonline.com/{self.domain}/.well-known/openid-configuration"
+                    response = self.session.get(url, timeout=15, verify=False)
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        m365_data['is_m365'] = True
+
+                        # Extract tenant ID from issuer (format: https://sts.windows.net/<tenant-id>/)
+                        issuer = data.get('issuer', '')
+                        match = re.search(r'/([0-9a-f-]{36})/?', issuer)
+                        if match:
+                            m365_data['tenant_id'] = match.group(1)
+                            self.print_success(f"Tenant ID: {m365_data['tenant_id']}")
+
+                        m365_data['tenant_region'] = data.get('tenant_region_scope', '')
+                        m365_data['cloud_instance'] = data.get('cloud_instance_name', '')
+
+                        if m365_data['tenant_region']:
+                            self.print_info(f"Tenant Region: {m365_data['tenant_region']}")
+                        if m365_data['cloud_instance']:
+                            self.print_info(f"Cloud Instance: {m365_data['cloud_instance']}")
+
+                    elif response.status_code == 400:
+                        # Likely AADSTS90002 - tenant not found
+                        body = response.text.lower()
+                        if 'aadsts90002' in body or 'not found' in body:
+                            self.print_info(f"Domain {self.domain} is not an M365 tenant")
+                            m365_data['is_m365'] = False
+                            self.results['m365_tenant'] = m365_data
+                            self.checkpoint('m365_tenant', 'm365_data', m365_data)
+                            self.checkpoint('m365_tenant', 'complete', True)
+                            return
+                        else:
+                            self.print_warning(f"openid-configuration returned 400: {response.text[:200]}")
+                    else:
+                        self.print_warning(f"openid-configuration returned status {response.status_code}")
+
+                except Exception as e:
+                    self.print_error(f"openid-configuration query failed: {e}")
+
+                # Endpoint 2: GetUserRealm via modern userrealm API
+                self.print_info(f"Querying userrealm API for federation posture...")
+
+                realm_endpoints = [
+                    f"https://login.microsoftonline.com/common/userrealm/aaaaaa@{self.domain}?api-version=2.1",
+                    f"https://login.microsoftonline.com/GetUserRealm.srf?login=aaaaaa@{self.domain}",
+                    f"https://login.microsoftonline.com/getuserrealm.srf?login=aaaaaa@{self.domain}&xml=1"
+                ]
+
+                realm_data = None
+                for url in realm_endpoints:
+                    try:
+                        response = self.session.get(
+                            url,
+                            headers={'Accept': 'application/json'},
+                            timeout=15,
+                            verify=False
+                        )
+
+                        if response.status_code == 200:
+                            # XML endpoint returns text/xml, JSON endpoints return application/json
+                            if 'xml' in response.headers.get('Content-Type', '').lower() or response.text.strip().startswith('<'):
+                                # Parse XML response
+                                ns_match = re.search(r'<NameSpaceType>([^<]+)</NameSpaceType>', response.text)
+                                brand_match = re.search(r'<FederationBrandName>([^<]+)</FederationBrandName>', response.text)
+                                auth_match = re.search(r'<AuthURL>([^<]+)</AuthURL>', response.text)
+                                cloud_match = re.search(r'<CloudInstanceName>([^<]+)</CloudInstanceName>', response.text)
+
+                                realm_data = {
+                                    'NameSpaceType': ns_match.group(1) if ns_match else '',
+                                    'FederationBrandName': brand_match.group(1) if brand_match else '',
+                                    'AuthURL': auth_match.group(1) if auth_match else '',
+                                    'CloudInstanceName': cloud_match.group(1) if cloud_match else ''
+                                }
+                            else:
+                                realm_data = response.json()
+
+                            if realm_data.get('NameSpaceType'):
+                                break  # Got useful data, stop trying endpoints
+
+                    except Exception as e:
+                        continue
+
+                if realm_data:
+                    m365_data['namespace_type'] = realm_data.get('NameSpaceType', '')
+                    m365_data['federation_brand'] = realm_data.get('FederationBrandName', '')
+                    m365_data['auth_url'] = realm_data.get('AuthURL', '') or ''
+
+                    if not m365_data.get('cloud_instance'):
+                        m365_data['cloud_instance'] = realm_data.get('CloudInstanceName', '')
+
+                    # If federated, extract host for Task 2 (ADFS discovery)
+                    if m365_data['auth_url']:
+                        match = re.search(r'https?://([^/]+)', m365_data['auth_url'])
+                        if match:
+                            m365_data['federation_host'] = match.group(1)
+
+                    if m365_data['namespace_type']:
+                        if m365_data['namespace_type'] == 'Federated':
+                            self.print_warning(f"Namespace Type: Federated (ADFS or 3rd-party IdP)")
+                            if m365_data['federation_host']:
+                                self.print_success(f"Federation Host: {m365_data['federation_host']}")
+                        elif m365_data['namespace_type'] == 'Managed':
+                            self.print_success(f"Namespace Type: Managed (cloud-native auth)")
+                        else:
+                            self.print_info(f"Namespace Type: {m365_data['namespace_type']}")
+
+                    if m365_data['federation_brand']:
+                        self.print_success(f"Brand: {m365_data['federation_brand']}")
+                else:
+                    self.print_warning("Could not determine federation posture from any realm endpoint")
+
+                # Store final results
+                self.results['m365_tenant'] = m365_data
+                self.checkpoint('m365_tenant', 'm365_data', m365_data)
+                self.checkpoint('m365_tenant', 'complete', True)
+
+                # Summary
+                if m365_data['is_m365']:
+                    self.print_info(f"\nM365 Tenant Summary:")
+                    self.print_info(f"  Tenant ID: {m365_data.get('tenant_id', 'Unknown')}")
+                    self.print_info(f"  Namespace: {m365_data.get('namespace_type') or 'Unknown'}")
+                    self.print_info(f"  Brand: {m365_data.get('federation_brand') or 'Unknown'}")
+                else:
+                    self.print_info("Domain does not appear to be an M365 tenant")
+
+    def adfs_endpoint_discovery(self):
+                """Discover and fingerprint ADFS endpoints for federated M365 tenants"""
+                self.print_section("ADFS ENDPOINT DISCOVERY")
+
+                # Restore from checkpoint if exists
+                resume_data = self.get_resume_data('adfs')
+                progress = resume_data.get('progress', {})
+
+                adfs_data = progress.get('adfs_data', {
+                    'hosts_probed': [],
+                    'endpoints_found': {},
+                    'version_info': {},
+                    'federation_metadata': {},
+                    'supported_endpoints': [],
+                    'token_signing_cert': {}
+                })
+
+                # Skip if already complete from checkpoint
+                if progress.get('complete'):
+                    self.print_info("Restored ADFS data from checkpoint")
+                    self.results['adfs'] = adfs_data
+                    return
+
+                # Gate: only run for federated M365 tenants
+                m365 = self.results.get('m365_tenant', {})
+                if not m365.get('is_m365'):
+                    self.print_info("Skipping ADFS discovery (not an M365 tenant)")
+                    self.results['adfs'] = adfs_data
+                    self.checkpoint('adfs', 'complete', True)
+                    return
+
+                if m365.get('namespace_type') != 'Federated':
+                    self.print_info(f"Skipping ADFS discovery (tenant is {m365.get('namespace_type', 'Unknown')}, not Federated)")
+                    self.results['adfs'] = adfs_data
+                    self.checkpoint('adfs', 'complete', True)
+                    return
+
+                # Build target host list
+                target_hosts = set()
+                federation_host = m365.get('federation_host', '')
+                if federation_host:
+                    target_hosts.add(federation_host)
+
+                adfs_guess = f"adfs.{self.domain}"
+                if adfs_guess != federation_host:
+                    target_hosts.add(adfs_guess)
+
+                if not target_hosts:
+                    self.print_warning("No ADFS hosts to probe")
+                    self.results['adfs'] = adfs_data
+                    self.checkpoint('adfs', 'complete', True)
+                    return
+
+                self.print_info(f"Probing {len(target_hosts)} ADFS host(s)")
+
+                # Endpoints to probe per host
+                endpoints = [
+                    ('idpinitiatedsignon', '/adfs/ls/idpinitiatedsignon.aspx'),
+                    ('federation_metadata', '/FederationMetadata/2007-06/FederationMetadata.xml'),
+                    ('ls_base', '/adfs/ls/'),
+                    ('ws_trust_mex', '/adfs/services/trust/mex'),
+                    ('oauth2_authorize', '/adfs/oauth2/authorize')
+                ]
+
+                for host in sorted(target_hosts):
+                    self.print_info(f"\nProbing {host}...")
+
+                    host_results = {
+                        'host': host,
+                        'reachable': False,
+                        'endpoints': {}
+                    }
+
+                    for endpoint_name, path in endpoints:
+                        url = f"https://{host}{path}"
+
+                        try:
+                            response = self.session.get(url, timeout=10, verify=False, allow_redirects=True)
+                            host_results['reachable'] = True
+
+                            endpoint_result = {
+                                'url': url,
+                                'status_code': response.status_code,
+                                'present': response.status_code in [200, 302, 401, 403]
+                            }
+
+                            # Extract data per endpoint type
+                            if endpoint_name == 'idpinitiatedsignon' and response.status_code == 200:
+                                # ADFS version disclosure in page content
+                                content = response.text
+
+                                # Page title
+                                title_match = re.search(r'<title>([^<]+)</title>', content, re.IGNORECASE)
+                                if title_match:
+                                    endpoint_result['page_title'] = title_match.group(1).strip()
+
+                                # Build number in script references
+                                build_match = re.search(r'/adfs/portal/(\d+\.\d+\.\d+\.\d+)/', content)
+                                if build_match:
+                                    endpoint_result['build_number'] = build_match.group(1)
+                                    adfs_data['version_info']['build_number'] = build_match.group(1)
+                                    self.print_success(f"  ADFS Build Number: {build_match.group(1)}")
+
+                                # Copyright year
+                                copyright_match = re.search(r'(?:Copyright|©|&copy;)[^<]*?(\d{4})', content)
+                                if copyright_match:
+                                    endpoint_result['copyright_year'] = copyright_match.group(1)
+
+                                # ADFS version inference from build number
+                                if build_match:
+                                    build = build_match.group(1)
+                                    if build.startswith('6.'):
+                                        adfs_data['version_info']['adfs_version'] = 'ADFS 4.0 (Server 2016)'
+                                    elif build.startswith('10.0.14'):
+                                        adfs_data['version_info']['adfs_version'] = 'ADFS 2019 (Server 2019)'
+                                    elif build.startswith('10.0.17') or build.startswith('10.0.20'):
+                                        adfs_data['version_info']['adfs_version'] = 'ADFS 2022 (Server 2022)'
+
+                                self.print_success(f"  Sign-on page reachable (status 200)")
+
+                            elif endpoint_name == 'federation_metadata' and response.status_code == 200:
+                                # Parse FederationMetadata.xml for endpoints and certs
+                                content = response.text
+
+                                # Entity ID
+                                entity_match = re.search(r'entityID="([^"]+)"', content)
+                                if entity_match:
+                                    endpoint_result['entity_id'] = entity_match.group(1)
+                                    adfs_data['federation_metadata']['entity_id'] = entity_match.group(1)
+                                    self.print_success(f"  Entity ID: {entity_match.group(1)}")
+
+                                # Role descriptors
+                                role_descriptors = re.findall(r'<RoleDescriptor[^>]+xsi:type="[^:]*:([^"]+)"', content)
+                                if role_descriptors:
+                                    endpoint_result['role_descriptors'] = list(set(role_descriptors))
+
+                                # Supported endpoint types
+                                supported = []
+                                if 'SingleSignOnService' in content:
+                                    supported.append('SAML2 SSO')
+                                if 'PassiveRequestorEndpoint' in content:
+                                    supported.append('WS-Federation Passive')
+                                if 'SecurityTokenServiceEndpoint' in content:
+                                    supported.append('WS-Trust STS')
+                                if 'wsFedellingService' in content or 'WSFederation' in content:
+                                    supported.append('WS-Federation')
+
+                                # Extract all binding URLs
+                                binding_urls = re.findall(r'Location="(https://[^"]+)"', content)
+                                if binding_urls:
+                                    endpoint_result['binding_urls'] = list(set(binding_urls))[:20]
+                                    adfs_data['supported_endpoints'] = list(set(binding_urls))[:20]
+
+                                if supported:
+                                    endpoint_result['supported_protocols'] = supported
+                                    self.print_success(f"  Supported: {', '.join(supported)}")
+
+                                # Token signing certificate details
+                                cert_match = re.search(r'<X509Certificate>([^<]+)</X509Certificate>', content)
+                                if cert_match:
+                                    cert_b64 = cert_match.group(1).strip()
+                                    endpoint_result['signing_cert_present'] = True
+                                    adfs_data['token_signing_cert']['present'] = True
+                                    adfs_data['token_signing_cert']['cert_b64_truncated'] = cert_b64[:200]
+
+                                    # Try to decode and extract cert details
+                                    try:
+                                        cert_der = base64.b64decode(cert_b64)
+                                        # Extract validity dates via regex on the decoded cert (ASN.1 parsing without external libs)
+                                        # Look for common cert patterns - this is best-effort
+                                        endpoint_result['signing_cert_size_bytes'] = len(cert_der)
+                                        self.print_success(f"  Token signing cert present ({len(cert_der)} bytes)")
+                                    except Exception:
+                                        pass
+
+                                self.print_success(f"  Federation metadata retrieved")
+
+                            elif endpoint_name == 'ws_trust_mex' and response.status_code == 200:
+                                # WS-Trust MEX endpoint - confirms WS-Trust support
+                                content_type = response.headers.get('Content-Type', '')
+                                if 'xml' in content_type.lower() or '<wsdl' in response.text.lower():
+                                    endpoint_result['ws_trust_supported'] = True
+                                    self.print_success(f"  WS-Trust MEX endpoint active")
+
+                                    # Extract WS-Trust binding URLs
+                                    trust_urls = re.findall(r'address="(https://[^"]*trust[^"]*)"', response.text, re.IGNORECASE)
+                                    if trust_urls:
+                                        endpoint_result['ws_trust_endpoints'] = list(set(trust_urls))
+
+                            elif endpoint_name == 'oauth2_authorize':
+                                # OAuth2 endpoint presence (ADFS 3.0+)
+                                if response.status_code in [200, 302, 400]:
+                                    endpoint_result['oauth2_supported'] = True
+                                    if 'oauth' in response.text.lower() or response.status_code == 302:
+                                        self.print_success(f"  OAuth2 endpoint active (ADFS 3.0+)")
+                                        adfs_data['version_info']['oauth2_supported'] = True
+
+                            elif endpoint_name == 'ls_base':
+                                # Base LS endpoint - status code tells us about presence
+                                if response.status_code in [200, 302, 401, 403]:
+                                    self.print_success(f"  Base /adfs/ls/ endpoint present (status {response.status_code})")
+
+                            # Capture server header if present
+                            if 'Server' in response.headers:
+                                endpoint_result['server_header'] = response.headers['Server']
+
+                            host_results['endpoints'][endpoint_name] = endpoint_result
+
+                        except requests.exceptions.SSLError as e:
+                            host_results['endpoints'][endpoint_name] = {
+                                'url': url,
+                                'error': 'SSL Error',
+                                'present': False
+                            }
+                        except requests.exceptions.ConnectionError:
+                            host_results['endpoints'][endpoint_name] = {
+                                'url': url,
+                                'error': 'Connection refused',
+                                'present': False
+                            }
+                        except requests.exceptions.Timeout:
+                            host_results['endpoints'][endpoint_name] = {
+                                'url': url,
+                                'error': 'Timeout',
+                                'present': False
+                            }
+                        except Exception as e:
+                            host_results['endpoints'][endpoint_name] = {
+                                'url': url,
+                                'error': str(e)[:100],
+                                'present': False
+                            }
+
+                        time.sleep(0.5)
+
+                    if not host_results['reachable']:
+                        self.print_warning(f"  Host {host} not reachable on any endpoint")
+
+                    adfs_data['hosts_probed'].append(host_results)
+                    adfs_data['endpoints_found'][host] = host_results['endpoints']
+
+                    # Checkpoint per host
+                    self.checkpoint('adfs', 'adfs_data', adfs_data)
+
+                # Store final results
+                self.results['adfs'] = adfs_data
+                self.checkpoint('adfs', 'adfs_data', adfs_data)
+                self.checkpoint('adfs', 'complete', True)
+
+                # Summary
+                reachable_hosts = [h for h in adfs_data['hosts_probed'] if h.get('reachable')]
+                self.print_info(f"\nADFS Discovery Summary:")
+                self.print_info(f"  Hosts probed: {len(adfs_data['hosts_probed'])}")
+                self.print_info(f"  Hosts reachable: {len(reachable_hosts)}")
+                if adfs_data['version_info'].get('adfs_version'):
+                    self.print_success(f"  ADFS Version: {adfs_data['version_info']['adfs_version']}")
+                if adfs_data['version_info'].get('build_number'):
+                    self.print_info(f"  Build: {adfs_data['version_info']['build_number']}")
+                if adfs_data['version_info'].get('oauth2_supported'):
+                    self.print_info(f"  OAuth2: Supported")
+                if adfs_data['federation_metadata'].get('entity_id'):
+                    self.print_info(f"  Entity ID: {adfs_data['federation_metadata']['entity_id']}")
+
     def load_config(self) -> Dict[str, str]:
             """Load configuration from file"""
             default_config = {
@@ -2764,86 +3184,156 @@ class ReconAutomation:
         return False
 
     def _check_certificate_transparency(self) -> List[str]:
-            """Check certificate transparency logs for subdomains"""
-            domains = []
-            target = self.domain.lower()
+                """Check certificate transparency logs for subdomains"""
+                domains = set()
+                target = self.domain.lower()
 
-            self.print_info(f"Querying crt.sh for {self.domain}...")
+                def in_scope(name: str) -> bool:
+                    name = name.strip().lower()
+                    if not name or '*' in name:
+                        return False
+                    return name == target or name.endswith(f'.{target}')
 
-            try:
-                # Try crt.sh with proper timeout and headers
-                url = f"https://crt.sh/?q=%.{self.domain}&output=json"
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
+                # =================================================================
+                # Source 1: crt.sh with retries on 502/503/504
+                # =================================================================
+                self.print_info(f"Querying crt.sh for {self.domain}...")
 
-                response = requests.get(url, timeout=30, headers=headers)
+                crtsh_max_retries = 3
+                crtsh_success = False
 
-                self.print_info(f"crt.sh response status: {response.status_code}")
-
-                if response.status_code == 200:
+                for attempt in range(crtsh_max_retries):
                     try:
-                        data = response.json()
-                        self.print_info(f"crt.sh returned {len(data)} certificate entries")
+                        url = f"https://crt.sh/?q=%.{self.domain}&output=json"
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        }
 
-                        for entry in data:
-                            name = entry.get('name_value', '')
-                            # Handle multiple domains in one cert
-                            for domain in name.split('\n'):
-                                domain = domain.strip().lower()
-                                # Skip wildcards and empty entries, only include in-scope domains
-                                if domain and '*' not in domain:
-                                    if domain == target or domain.endswith(f'.{target}'):
-                                        domains.append(domain)
+                        response = requests.get(url, timeout=30, headers=headers)
+                        self.print_info(f"crt.sh response status: {response.status_code} (attempt {attempt+1}/{crtsh_max_retries})")
 
-                        # Remove duplicates
-                        domains = list(set(domains))
-                        self.print_success(f"Extracted {len(domains)} unique in-scope domains from certificates")
+                        if response.status_code == 200:
+                            try:
+                                data = response.json()
+                                self.print_info(f"crt.sh returned {len(data)} certificate entries")
 
-                    except json.JSONDecodeError as e:
-                        self.print_error(f"Failed to parse crt.sh JSON response: {e}")
-                        self.print_info(f"Response preview: {response.text[:500]}")
-                else:
-                    self.print_warning(f"crt.sh returned status {response.status_code}")
-                    self.print_info(f"Response: {response.text[:200]}")
+                                for entry in data:
+                                    name = entry.get('name_value', '')
+                                    for d in name.split('\n'):
+                                        if in_scope(d):
+                                            domains.add(d.strip().lower())
 
-            except requests.exceptions.Timeout:
-                self.print_error("crt.sh request timed out after 30 seconds")
-            except requests.exceptions.ConnectionError as e:
-                self.print_error(f"Connection error to crt.sh: {e}")
-            except Exception as e:
-                self.print_error(f"CT log check failed: {e}")
-                import traceback
-                traceback.print_exc()
+                                self.print_success(f"crt.sh: extracted {len(domains)} unique in-scope domains")
+                                crtsh_success = True
+                                break
 
-            # Try alternative CT log source if crt.sh failed
-            if not domains:
-                self.print_info("Trying alternative CT source (certspotter)...")
-                try:
-                    url = f"https://api.certspotter.com/v1/issuances?domain={self.domain}&include_subdomains=true&expand=dns_names"
-                    response = requests.get(url, timeout=30)
+                            except json.JSONDecodeError as e:
+                                self.print_error(f"Failed to parse crt.sh JSON response: {e}")
+                                self.print_info(f"Response preview: {response.text[:200]}")
+                                break
 
-                    if response.status_code == 200:
-                        data = response.json()
-                        self.print_info(f"certspotter returned {len(data)} entries")
+                        elif response.status_code in (502, 503, 504):
+                            if attempt < crtsh_max_retries - 1:
+                                backoff = 5 * (attempt + 1)
+                                self.print_warning(f"crt.sh returned {response.status_code}, retrying in {backoff}s...")
+                                time.sleep(backoff)
+                                continue
+                            else:
+                                self.print_warning(f"crt.sh persistently returning {response.status_code}, falling back to other sources")
+                                break
 
-                        for entry in data:
-                            dns_names = entry.get('dns_names', [])
-                            for name in dns_names:
-                                name = name.strip().lower()
-                                if name and '*' not in name:
-                                    if name == target or name.endswith(f'.{target}'):
-                                        domains.append(name)
+                        else:
+                            self.print_warning(f"crt.sh returned status {response.status_code}")
+                            self.print_info(f"Response: {response.text[:200]}")
+                            break
 
-                        domains = list(set(domains))
-                        self.print_success(f"Extracted {len(domains)} unique in-scope domains from certspotter")
-                    else:
-                        self.print_warning(f"certspotter returned status {response.status_code}")
+                    except requests.exceptions.Timeout:
+                        if attempt < crtsh_max_retries - 1:
+                            self.print_warning(f"crt.sh timeout (attempt {attempt+1}/{crtsh_max_retries}), retrying...")
+                            time.sleep(5)
+                            continue
+                        else:
+                            self.print_error("crt.sh timed out after all retries")
+                            break
 
-                except Exception as e:
-                    self.print_error(f"certspotter check failed: {e}")
+                    except requests.exceptions.ConnectionError as e:
+                        if attempt < crtsh_max_retries - 1:
+                            self.print_warning(f"crt.sh connection error, retrying...")
+                            time.sleep(5)
+                            continue
+                        else:
+                            self.print_error(f"Connection error to crt.sh: {e}")
+                            break
 
-            return list(set(domains))
+                    except Exception as e:
+                        self.print_error(f"crt.sh check failed: {e}")
+                        break
+
+                # =================================================================
+                # Source 2: certspotter (always run if crt.sh did not succeed)
+                # =================================================================
+                if not crtsh_success:
+                    self.print_info("Trying certspotter...")
+                    try:
+                        url = f"https://api.certspotter.com/v1/issuances?domain={self.domain}&include_subdomains=true&expand=dns_names"
+                        response = requests.get(url, timeout=30,
+                                                headers={'User-Agent': 'Mozilla/5.0'})
+
+                        if response.status_code == 200:
+                            data = response.json()
+                            before = len(domains)
+                            for entry in data:
+                                for name in entry.get('dns_names', []):
+                                    if in_scope(name):
+                                        domains.add(name.strip().lower())
+                            added = len(domains) - before
+                            self.print_success(f"certspotter: added {added} new in-scope domains")
+                        elif response.status_code == 429:
+                            self.print_warning("certspotter rate limited")
+                        else:
+                            self.print_warning(f"certspotter returned status {response.status_code}")
+
+                    except Exception as e:
+                        self.print_error(f"certspotter check failed: {e}")
+
+                # =================================================================
+                # Source 3: HackerTarget hostsearch (free, no key, reliable)
+                # =================================================================
+                if not crtsh_success:
+                    self.print_info("Trying hackertarget hostsearch...")
+                    try:
+                        url = f"https://api.hackertarget.com/hostsearch/?q={self.domain}"
+                        response = requests.get(url, timeout=30,
+                                                headers={'User-Agent': 'Mozilla/5.0'})
+
+                        if response.status_code == 200:
+                            text = response.text or ''
+                            # Rate-limit response is plain text starting with "API count exceeded"
+                            if 'API count exceeded' in text or 'error' in text.lower()[:50]:
+                                self.print_warning(f"hackertarget: {text.strip()[:100]}")
+                            else:
+                                before = len(domains)
+                                for line in text.splitlines():
+                                    # Format: hostname,ip
+                                    parts = line.split(',', 1)
+                                    if parts and in_scope(parts[0]):
+                                        domains.add(parts[0].strip().lower())
+                                added = len(domains) - before
+                                self.print_success(f"hackertarget: added {added} new in-scope domains")
+                        else:
+                            self.print_warning(f"hackertarget returned status {response.status_code}")
+
+                    except Exception as e:
+                        self.print_error(f"hackertarget check failed: {e}")
+
+                # =================================================================
+                # Source 4: Google's CT log search via crt.sh alternate ID format
+                # (only if everything else failed and we have nothing)
+                # =================================================================
+                if not domains:
+                    self.print_warning("All CT sources failed - DNS enumeration will rely on bruteforce only")
+
+                return list(domains)
 
     def _dns_bruteforce(self) -> List[str]:
         """Brute force common subdomain names"""
@@ -2985,58 +3475,207 @@ class ReconAutomation:
             self.print_success(f"\nTechnology stack identified for {len(tech_stack)} targets")
 
     def _identify_technologies(self, domain: str) -> Dict[str, Any]:
-        """Identify technologies for a specific domain"""
-        tech_info = {'headers': {}, 'server': None, 'powered_by': None}
+            """Identify technologies for a specific domain including VPN/remote access appliances"""
+            tech_info = {'headers': {}, 'server': None, 'powered_by': None}
 
-        for protocol in ['https', 'http']:
-            try:
-                url = f"{protocol}://{domain}"
-                response = requests.get(url, timeout=10, verify=False, allow_redirects=True)
-
-                # Extract interesting headers
-                interesting_headers = [
-                    'Server', 'X-Powered-By', 'X-AspNet-Version', 'X-AspNetMvc-Version',
-                    'X-Generator', 'X-Drupal-Cache', 'X-Content-Type-Options',
-                    'X-Frame-Options', 'Strict-Transport-Security'
-                ]
-
-                for header in interesting_headers:
-                    if header in response.headers:
-                        tech_info['headers'][header] = response.headers[header]
-                        if header == 'Server':
-                            tech_info['server'] = response.headers[header]
-                        elif header == 'X-Powered-By':
-                            tech_info['powered_by'] = response.headers[header]
-
-                # Look for technology indicators in HTML
-                html = response.text.lower()
-                indicators = {
-                    'wordpress': 'wp-content',
-                    'drupal': 'drupal',
-                    'joomla': 'joomla',
-                    'sharepoint': 'sharepoint',
-                    'asp.net': '__viewstate',
-                    'php': '.php',
-                    'apache': 'apache',
-                    'nginx': 'nginx'
+            # Appliance fingerprints: keyed by class, each entry has match patterns and optional secondary path
+            appliance_fingerprints = {
+                'F5 BIG-IP': {
+                    'headers': [r'BigIP', r'BIG-IP'],
+                    'cookies': [r'BIGipServer', r'TS[0-9a-f]{8,}', r'F5_ST'],
+                    'html': [r'/my\.policy', r'F5 Networks'],
+                    'version_patterns': [r'BIG-IP[^\d]*(\d+\.\d+\.\d+)', r'TMOS[^\d]*(\d+\.\d+\.\d+)'],
+                    'secondary_path': '/my.policy'
+                },
+                'Citrix Netscaler/ADC': {
+                    'headers': [r'NetScaler', r'Citrix'],
+                    'cookies': [r'NSC_', r'NSC_USER', r'pwcount'],
+                    'html': [r'/vpn/index\.html', r'Citrix Gateway', r'NetScaler Gateway', r'_ctxs_AuthId'],
+                    'version_patterns': [r'NS([\d.]+)', r'NSBuild[^\d]*(\d+)', r'Build[^\d]*(\d+\.\d+)'],
+                    'secondary_path': '/vpn/index.html'
+                },
+                'FortiGate SSLVPN': {
+                    'headers': [r'xxxxxxxx-xxxxx', r'Fortinet'],
+                    'cookies': [r'SVPNCOOKIE', r'FGTServer'],
+                    'html': [r'/remote/login', r'fgt_lang', r'FortiGate', r'sslvpn'],
+                    'version_patterns': [r'FortiGate[^\d]*(\d+\.\d+\.\d+)'],
+                    'secondary_path': '/remote/login'
+                },
+                'GlobalProtect (Palo Alto)': {
+                    'headers': [],
+                    'cookies': [r'PHPSESSID.*paloalto', r'clientVer'],
+                    'html': [r'global-protect', r'GlobalProtect', r'/sslmgr', r'pan-clientver'],
+                    'version_patterns': [r'clientVer[^\d]*(\d+\.\d+\.\d+)', r'GlobalProtect[^\d]*(\d+\.\d+\.\d+)'],
+                    'secondary_path': '/global-protect/login.esp'
+                },
+                'Cisco AnyConnect/ASA': {
+                    'headers': [r'Cisco', r'ASA'],
+                    'cookies': [r'webvpn', r'webvpnLogin', r'webvpnPin'],
+                    'html': [r'/\+CSCOE\+/', r'AnyConnect', r'Cisco Systems', r'webvpn_logo'],
+                    'version_patterns': [r'ASA[^\d]*(\d+\.\d+\(\d+\))', r'AnyConnect[^\d]*(\d+\.\d+\.\d+)'],
+                    'secondary_path': '/+CSCOE+/logon.html'
+                },
+                'Pulse Secure/Ivanti Connect Secure': {
+                    'headers': [r'Pulse', r'Ivanti'],
+                    'cookies': [r'DSID', r'DSLastAccess', r'DSSIGNIN'],
+                    'html': [r'/dana-na/', r'Pulse Secure', r'Ivanti Connect Secure', r'welcome\.cgi'],
+                    'version_patterns': [r'Pulse Secure[^\d]*(\d+\.\d+)', r'(\d+\.\d+R\d+)'],
+                    'secondary_path': '/dana-na/auth/url_default/welcome.cgi'
+                },
+                'SonicWall NetExtender/SMA': {
+                    'headers': [r'SonicWALL', r'SonicOS'],
+                    'cookies': [r'swap', r'sessId'],
+                    'html': [r'SonicWall', r'NetExtender', r'/cgi-bin/welcome', r'sw_logo'],
+                    'version_patterns': [r'SonicOS[^\d]*(\d+\.\d+\.\d+)', r'SMA[^\d]*(\d+\.\d+\.\d+)'],
+                    'secondary_path': '/cgi-bin/welcome'
+                },
+                'Microsoft RD Web Access': {
+                    'headers': [r'Microsoft-IIS', r'Microsoft-HTTPAPI'],
+                    'cookies': [r'TSWAAuthHttpModule'],
+                    'html': [r'/RDWeb/', r'RD Web Access', r'Remote Desktop Services', r'TSWebAccess'],
+                    'version_patterns': [r'Microsoft-IIS/(\d+\.\d+)'],
+                    'secondary_path': '/RDWeb/Pages/en-US/login.aspx'
+                },
+                'Check Point Mobile Access': {
+                    'headers': [r'Check Point'],
+                    'cookies': [r'CPCVPN_SESSION_ID', r'selected_realm'],
+                    'html': [r'/sslvpn/Login/Login', r'Check Point', r'Mobile Access Portal'],
+                    'version_patterns': [r'R\d{2}[\d.]*'],
+                    'secondary_path': '/sslvpn/Login/Login'
                 }
+            }
 
-                detected = []
-                for tech, indicator in indicators.items():
-                    if indicator in html:
-                        detected.append(tech)
+            # Standard tech indicators (existing)
+            indicators = {
+                'wordpress': 'wp-content',
+                'drupal': 'drupal',
+                'joomla': 'joomla',
+                'sharepoint': 'sharepoint',
+                'asp.net': '__viewstate',
+                'php': '.php',
+                'apache': 'apache',
+                'nginx': 'nginx'
+            }
 
-                if detected:
-                    tech_info['detected_technologies'] = detected
+            # Extended interesting headers
+            interesting_headers = [
+                'Server', 'X-Powered-By', 'X-AspNet-Version', 'X-AspNetMvc-Version',
+                'X-Generator', 'X-Drupal-Cache', 'X-Content-Type-Options',
+                'X-Frame-Options', 'Strict-Transport-Security', 'Set-Cookie'
+            ]
 
-                break  # If HTTPS works, no need to try HTTP
+            def match_appliance(response_text: str, response_headers, set_cookie: str) -> Optional[Dict[str, str]]:
+                """Match response against appliance fingerprints. Returns dict with class, version, evidence."""
+                header_blob = ' '.join(f"{k}: {v}" for k, v in response_headers.items())
+                search_text = (response_text or '')[:50000].lower()
+                cookie_blob = (set_cookie or '').lower()
+                header_blob_lower = header_blob.lower()
 
-            except requests.exceptions.SSLError:
-                continue
-            except Exception as e:
-                continue
+                for appliance_class, fp in appliance_fingerprints.items():
+                    score = 0
+                    evidence = []
 
-        return tech_info if tech_info['headers'] or tech_info.get('detected_technologies') else None
+                    for pattern in fp['headers']:
+                        if re.search(pattern, header_blob, re.IGNORECASE):
+                            score += 2
+                            evidence.append(f"header: {pattern}")
+                            break
+
+                    for pattern in fp['cookies']:
+                        if re.search(pattern, cookie_blob, re.IGNORECASE) or re.search(pattern, header_blob, re.IGNORECASE):
+                            score += 2
+                            evidence.append(f"cookie: {pattern}")
+                            break
+
+                    for pattern in fp['html']:
+                        if re.search(pattern, search_text, re.IGNORECASE):
+                            score += 1
+                            evidence.append(f"html: {pattern}")
+
+                    if score >= 2:
+                        version = None
+                        for vpattern in fp['version_patterns']:
+                            match = re.search(vpattern, response_text or '', re.IGNORECASE) or re.search(vpattern, header_blob, re.IGNORECASE)
+                            if match:
+                                version = match.group(1) if match.groups() else match.group(0)
+                                break
+
+                        return {
+                            'class': appliance_class,
+                            'version': version or 'Unknown',
+                            'evidence': evidence[:3],
+                            'secondary_path': fp.get('secondary_path')
+                        }
+
+                return None
+
+            for protocol in ['https', 'http']:
+                try:
+                    url = f"{protocol}://{domain}"
+                    response = requests.get(url, timeout=10, verify=False, allow_redirects=True)
+
+                    # Extract interesting headers
+                    for header in interesting_headers:
+                        if header in response.headers:
+                            tech_info['headers'][header] = response.headers[header]
+                            if header == 'Server':
+                                tech_info['server'] = response.headers[header]
+                            elif header == 'X-Powered-By':
+                                tech_info['powered_by'] = response.headers[header]
+
+                    html = response.text.lower()
+                    detected = []
+                    for tech, indicator in indicators.items():
+                        if indicator in html:
+                            detected.append(tech)
+                    if detected:
+                        tech_info['detected_technologies'] = detected
+
+                    # Appliance fingerprinting against root response
+                    set_cookie = response.headers.get('Set-Cookie', '')
+                    appliance = match_appliance(response.text, response.headers, set_cookie)
+
+                    # Conditional secondary probe: small response, redirect to login-like path, or generic server header
+                    if not appliance:
+                        is_ambiguous = (
+                            len(response.content) < 5000 or
+                            any(x in response.url.lower() for x in ['login', 'logon', 'auth', 'signin', 'sso']) or
+                            response.status_code in [401, 403] or
+                            tech_info.get('server', '').lower() in ['', 'unknown', 'apache', 'nginx', 'microsoft-iis/8.5', 'microsoft-iis/10.0']
+                        )
+
+                        if is_ambiguous:
+                            # Try the most likely appliance paths in priority order
+                            priority_paths = [
+                                '/my.policy', '/vpn/index.html', '/remote/login',
+                                '/dana-na/auth/url_default/welcome.cgi', '/+CSCOE+/logon.html',
+                                '/global-protect/login.esp', '/RDWeb/Pages/en-US/login.aspx',
+                                '/sslvpn/Login/Login', '/cgi-bin/welcome'
+                            ]
+                            for path in priority_paths:
+                                try:
+                                    probe_url = f"{protocol}://{domain}{path}"
+                                    probe_resp = requests.get(probe_url, timeout=8, verify=False, allow_redirects=True)
+                                    if probe_resp.status_code in [200, 302, 401, 403]:
+                                        probe_cookie = probe_resp.headers.get('Set-Cookie', '')
+                                        appliance = match_appliance(probe_resp.text, probe_resp.headers, probe_cookie)
+                                        if appliance:
+                                            appliance['probe_path'] = path
+                                            break
+                                except:
+                                    continue
+
+                    if appliance:
+                        tech_info['vpn_appliance'] = appliance
+
+                    break
+
+                except requests.exceptions.SSLError:
+                    continue
+                except Exception as e:
+                    continue
+
+            return tech_info if tech_info['headers'] or tech_info.get('detected_technologies') or tech_info.get('vpn_appliance') else None
 
     def email_harvesting(self):
             """Harvest email addresses from multiple public sources"""
@@ -4885,46 +5524,497 @@ class ReconAutomation:
         self.print_success(f"Report template saved to: {template_file}")
 
     def _generate_markdown_report(self, filepath: Path):
-                """Generate markdown format report"""
-                with open(filepath, 'w') as f:
-                    f.write(f"# Penetration Testing Reconnaissance Report\n\n")
-                    f.write(f"**Client:** {self.client_name}\n\n")
-                    f.write(f"**Domain:** {self.domain}\n\n")
-                    f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    f.write(f"---\n\n")
+                    """Generate markdown format report"""
+                    with open(filepath, 'w') as f:
+                        f.write(f"# Penetration Testing Reconnaissance Report\n\n")
+                        f.write(f"**Client:** {self.client_name}\n\n")
+                        f.write(f"**Domain:** {self.domain}\n\n")
+                        f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                        f.write(f"---\n\n")
 
-                    # Scope Validation
-                    f.write(f"## Scope Validation\n\n")
+                        # Scope Validation
+                        f.write(f"## Scope Validation\n\n")
 
-                    # Domain WHOIS
-                    domain_whois = self.results.get('scope_validation', {}).get('domain_whois', {})
-                    if domain_whois:
-                        f.write(f"### Domain Registration ({self.domain})\n\n")
+                        # Domain WHOIS
+                        domain_whois = self.results.get('scope_validation', {}).get('domain_whois', {})
+                        if domain_whois:
+                            f.write(f"### Domain Registration ({self.domain})\n\n")
 
-                        if domain_whois.get('privacy_protected'):
-                            f.write(f"**Note:** Domain uses privacy protection\n\n")
+                            if domain_whois.get('privacy_protected'):
+                                f.write(f"**Note:** Domain uses privacy protection\n\n")
 
-                        if domain_whois.get('organizations'):
-                            f.write(f"**Organizations:**\n")
-                            for org in domain_whois['organizations']:
-                                f.write(f"- {org}\n")
+                            if domain_whois.get('organizations'):
+                                f.write(f"**Organizations:**\n")
+                                for org in domain_whois['organizations']:
+                                    f.write(f"- {org}\n")
+                                f.write(f"\n")
+
+                            if domain_whois.get('emails'):
+                                f.write(f"**Contact Emails:**\n")
+                                for email in domain_whois['emails']:
+                                    f.write(f"- {email}\n")
+                                f.write(f"\n")
+
+                            if domain_whois.get('phones'):
+                                f.write(f"**Contact Phones:**\n")
+                                for phone in domain_whois['phones']:
+                                    f.write(f"- {phone}\n")
+                                f.write(f"\n")
+
+                            if domain_whois.get('addresses'):
+                                f.write(f"**Physical Addresses:**\n")
+                                for addr in domain_whois['addresses']:
+                                    addr_str = f"{addr['street']}, {addr['city']}"
+                                    if addr.get('state'):
+                                        addr_str += f", {addr['state']}"
+                                    if addr.get('postal_code'):
+                                        addr_str += f" {addr['postal_code']}"
+                                    if addr.get('country'):
+                                        addr_str += f", {addr['country']}"
+                                    f.write(f"- {addr_str} ({addr.get('source', 'registrant')})\n")
+                                f.write(f"\n")
+
+                            if domain_whois.get('name_servers'):
+                                f.write(f"**Name Servers:**\n")
+                                for ns in domain_whois['name_servers']:
+                                    f.write(f"- {ns}\n")
+                                f.write(f"\n")
+
+                            if domain_whois.get('created'):
+                                f.write(f"**Created:** {domain_whois['created']}\n")
+                            if domain_whois.get('expires'):
+                                f.write(f"**Expires:** {domain_whois['expires']}\n")
                             f.write(f"\n")
 
-                        if domain_whois.get('emails'):
-                            f.write(f"**Contact Emails:**\n")
-                            for email in domain_whois['emails']:
-                                f.write(f"- {email}\n")
+                        # IP Range WHOIS
+                        whois = self.results.get('scope_validation', {}).get('whois', {})
+                        if whois:
+                            f.write(f"### IP Range Ownership\n\n")
+                            for ip_range, info in whois.items():
+                                f.write(f"#### {ip_range}\n")
+                                f.write(f"- **Organization:** {info.get('org', 'N/A')}\n")
+                                f.write(f"- **Net Range:** {info.get('netrange', 'N/A')}\n")
+                                f.write(f"- **Country:** {info.get('country', 'N/A')}\n\n")
+
+                        # M365/Azure AD Tenant Attribution
+                        m365 = self.results.get('m365_tenant', {})
+                        if m365 and m365.get('is_m365'):
+                            f.write(f"## M365/Azure AD Tenant Attribution\n\n")
+                            f.write(f"- **Tenant ID:** {m365.get('tenant_id', 'Unknown')}\n")
+                            if m365.get('tenant_region'):
+                                f.write(f"- **Tenant Region:** {m365['tenant_region']}\n")
+                            if m365.get('cloud_instance'):
+                                f.write(f"- **Cloud Instance:** {m365['cloud_instance']}\n")
+                            if m365.get('namespace_type'):
+                                f.write(f"- **Namespace Type:** {m365['namespace_type']}\n")
+                            if m365.get('federation_brand'):
+                                f.write(f"- **Federation Brand:** {m365['federation_brand']}\n")
+                            if m365.get('namespace_type') == 'Federated':
+                                if m365.get('auth_url'):
+                                    f.write(f"- **Federation AuthURL:** {m365['auth_url']}\n")
+                                if m365.get('federation_host'):
+                                    f.write(f"- **Federation Host:** {m365['federation_host']}\n")
+                                f.write(f"\n**Note:** Federated tenant identified. On-premises identity provider (likely ADFS) presents additional external attack surface.\n")
+                            elif m365.get('namespace_type') == 'Managed':
+                                f.write(f"\n**Note:** Cloud-native managed tenant. Authentication surface is the M365 sign-in endpoint.\n")
+                            f.write(f"\n")
+                        elif m365 and not m365.get('is_m365'):
+                            f.write(f"## M365/Azure AD Tenant Attribution\n\n")
+                            f.write(f"Domain does not appear to be associated with an M365/Azure AD tenant.\n\n")
+
+                        # ADFS Endpoint Discovery
+                        adfs = self.results.get('adfs', {})
+                        hosts_probed = adfs.get('hosts_probed', [])
+                        reachable_hosts = [h for h in hosts_probed if h.get('reachable')]
+
+                        if reachable_hosts:
+                            f.write(f"## ADFS Endpoint Discovery\n\n")
+                            f.write(f"**Reachable ADFS Hosts:** {len(reachable_hosts)}\n\n")
+
+                            version_info = adfs.get('version_info', {})
+                            if version_info.get('adfs_version'):
+                                f.write(f"**ADFS Version:** {version_info['adfs_version']}\n\n")
+                            if version_info.get('build_number'):
+                                f.write(f"**Build Number:** {version_info['build_number']}\n\n")
+                            if version_info.get('oauth2_supported'):
+                                f.write(f"**OAuth2 Support:** Yes (ADFS 3.0+)\n\n")
+
+                            fed_metadata = adfs.get('federation_metadata', {})
+                            if fed_metadata.get('entity_id'):
+                                f.write(f"**Entity ID:** `{fed_metadata['entity_id']}`\n\n")
+
+                            for host_data in reachable_hosts:
+                                host = host_data['host']
+                                f.write(f"### {host}\n\n")
+
+                                for endpoint_name, endpoint_data in host_data.get('endpoints', {}).items():
+                                    if endpoint_data.get('present'):
+                                        f.write(f"- **{endpoint_name}:** {endpoint_data.get('url', '')} (status {endpoint_data.get('status_code', 'N/A')})\n")
+                                        if endpoint_data.get('build_number'):
+                                            f.write(f"  - Build: {endpoint_data['build_number']}\n")
+                                        if endpoint_data.get('supported_protocols'):
+                                            f.write(f"  - Protocols: {', '.join(endpoint_data['supported_protocols'])}\n")
+                                        if endpoint_data.get('signing_cert_present'):
+                                            f.write(f"  - Token signing certificate present\n")
+                                        if endpoint_data.get('ws_trust_supported'):
+                                            f.write(f"  - WS-Trust MEX active\n")
+                                        if endpoint_data.get('oauth2_supported'):
+                                            f.write(f"  - OAuth2 endpoint active\n")
+
+                                f.write(f"\n")
+
+                            supported_endpoints = adfs.get('supported_endpoints', [])
+                            if supported_endpoints:
+                                f.write(f"### Federation Endpoints Discovered\n\n")
+                                for url in supported_endpoints[:20]:
+                                    f.write(f"- `{url}`\n")
+                                f.write(f"\n")
+
+                            f.write(f"**Note:** ADFS version disclosure provides input for vulnerability analysis. ")
+                            f.write(f"Recent CVE history on ADFS includes authentication bypass, golden SAML attacks, ")
+                            f.write(f"and pre-auth disclosure issues. Review current advisories against the identified version before Phase 3.\n\n")
+
+                        # DNS Enumeration
+                        f.write(f"## DNS Enumeration\n\n")
+                        dns = self.results.get('dns_enumeration', {})
+
+                        resolved_external = dns.get('resolved_external', {})
+                        resolved_internal = dns.get('resolved_internal', {})
+                        resolved = dns.get('resolved', {})
+
+                        f.write(f"**Total Subdomains Discovered:** {dns.get('total_discovered', 0)}\n")
+                        f.write(f"**Resolved (External):** {len(resolved_external)}\n")
+                        f.write(f"**Resolved (Internal):** {len(resolved_internal)}\n\n")
+
+                        # CT Log domains
+                        ct_domains = dns.get('ct_log_domains', [])
+                        if ct_domains:
+                            f.write(f"### Certificate Transparency Log Domains ({len(ct_domains)})\n\n")
+                            f.write(f"Domains discovered via crt.sh and certificate transparency logs:\n\n")
+                            for domain in ct_domains:
+                                f.write(f"- `{domain}`\n")
                             f.write(f"\n")
 
-                        if domain_whois.get('phones'):
-                            f.write(f"**Contact Phones:**\n")
-                            for phone in domain_whois['phones']:
-                                f.write(f"- {phone}\n")
+                        # Bruteforce domains
+                        brute_domains = dns.get('bruteforce_domains', [])
+                        if brute_domains:
+                            f.write(f"### DNS Bruteforce Domains ({len(brute_domains)})\n\n")
+                            f.write(f"Domains discovered via DNS bruteforce enumeration:\n\n")
+                            for domain in brute_domains:
+                                f.write(f"- `{domain}`\n")
                             f.write(f"\n")
 
-                        if domain_whois.get('addresses'):
-                            f.write(f"**Physical Addresses:**\n")
-                            for addr in domain_whois['addresses']:
+                        # External resolved subdomains (public IPs)
+                        if resolved_external:
+                            f.write(f"### External Subdomains ({len(resolved_external)})\n\n")
+                            f.write(f"Subdomains resolving to public IP addresses:\n\n")
+                            for subdomain, ips in sorted(resolved_external.items()):
+                                f.write(f"- `{subdomain}` -> {', '.join(ips)}\n")
+                            f.write(f"\n")
+
+                        # Internal resolved subdomains (private IPs) - Information Disclosure
+                        if resolved_internal:
+                            f.write(f"### Internal Subdomains ({len(resolved_internal)}) - INFORMATION DISCLOSURE\n\n")
+                            f.write(f"**Finding:** Internal hostnames exposed in public DNS records.\n\n")
+                            f.write(f"**Risk:** These subdomains resolve to private/internal IP addresses (RFC 1918), ")
+                            f.write(f"revealing internal network structure to external attackers. This information can be used to:\n\n")
+                            f.write(f"- Map internal network topology\n")
+                            f.write(f"- Identify internal naming conventions\n")
+                            f.write(f"- Target systems during internal penetration testing\n")
+                            f.write(f"- Craft more convincing phishing attacks\n\n")
+                            f.write(f"**Affected Subdomains:**\n\n")
+                            for subdomain, ips in sorted(resolved_internal.items()):
+                                f.write(f"- `{subdomain}` -> {', '.join(ips)}\n")
+                            f.write(f"\n")
+                            f.write(f"**Recommendation:** Remove internal DNS records from public-facing DNS servers ")
+                            f.write(f"or implement split-horizon DNS to prevent internal hostname disclosure.\n\n")
+
+                        # Fallback to old resolved format if new format not available
+                        if not resolved_external and not resolved_internal and resolved:
+                            f.write(f"### Resolved Subdomains ({len(resolved)})\n\n")
+                            f.write(f"Subdomains that successfully resolved to IP addresses:\n\n")
+                            for subdomain, ips in sorted(resolved.items()):
+                                f.write(f"- `{subdomain}` -> {', '.join(ips)}\n")
+                            f.write(f"\n")
+
+                        # Unresolved domains
+                        unresolved = dns.get('unresolved', [])
+                        if unresolved:
+                            f.write(f"### Unresolved Domains ({len(unresolved)})\n\n")
+                            f.write(f"Domains that did not resolve (may be expired, internal, or misconfigured):\n\n")
+                            for domain in unresolved[:100]:
+                                f.write(f"- `{domain}`\n")
+                            if len(unresolved) > 100:
+                                f.write(f"- ... and {len(unresolved) - 100} more\n")
+                            f.write(f"\n")
+
+                        # Infrastructure Summary (from WHOIS)
+                        infra_summary = dns.get('infrastructure_summary', {})
+                        if infra_summary:
+                            f.write(f"### Infrastructure Summary\n\n")
+                            f.write(f"Organizations identified from IP WHOIS lookups:\n\n")
+                            for org, data in sorted(infra_summary.items(), key=lambda x: len(x[1].get('ips', [])), reverse=True):
+                                ip_count = len(data.get('ips', []))
+                                f.write(f"#### {org}\n")
+                                f.write(f"- **IPs:** {ip_count}\n")
+                                if data.get('country'):
+                                    f.write(f"- **Country:** {data['country']}\n")
+                                if data.get('netranges'):
+                                    f.write(f"- **Network Ranges:** {', '.join(data['netranges'])}\n")
+                                f.write(f"\n")
+
+                        # Subdomain Takeover
+                        f.write(f"## Subdomain Takeover Vulnerabilities\n\n")
+                        takeovers = self.results.get('subdomain_takeovers', [])
+                        if takeovers:
+                            f.write(f"**Potentially Vulnerable Subdomains:** {len(takeovers)}\n\n")
+                            for vuln in takeovers:
+                                f.write(f"### {vuln['subdomain']}\n")
+                                f.write(f"- **Service:** {vuln['service']}\n")
+                                f.write(f"- **Confidence:** {vuln.get('confidence', 'Unknown')}\n")
+                                if vuln.get('cname'):
+                                    f.write(f"- **CNAME:** {', '.join(vuln['cname'])}\n")
+                                f.write(f"- **Risk:** Subdomain may be claimable by attacker\n\n")
+                        else:
+                            f.write(f"No subdomain takeover vulnerabilities detected.\n\n")
+
+                        # Technology Stack
+                        f.write(f"## Technology Stack\n\n")
+                        tech = self.results.get('technology_stack', {})
+                        if tech:
+                            f.write(f"**Systems Analyzed:** {len(tech)}\n\n")
+
+                            # Surface VPN/remote access appliances first as high-value findings
+                            appliance_hosts = {h: info for h, info in tech.items() if info.get('vpn_appliance')}
+                            if appliance_hosts:
+                                f.write(f"### Remote Access Appliances ({len(appliance_hosts)})\n\n")
+                                for host, info in sorted(appliance_hosts.items()):
+                                    appliance = info['vpn_appliance']
+                                    f.write(f"#### {host}\n")
+                                    f.write(f"- **Appliance Class:** {appliance['class']}\n")
+                                    f.write(f"- **Version:** {appliance['version']}\n")
+                                    if appliance.get('probe_path'):
+                                        f.write(f"- **Detected At:** `{appliance['probe_path']}`\n")
+                                    if appliance.get('evidence'):
+                                        f.write(f"- **Evidence:** {', '.join(appliance['evidence'])}\n")
+                                    f.write(f"\n")
+                                f.write(f"**Note:** Remote access appliance version disclosure supports vulnerability analysis. ")
+                                f.write(f"Recent CVE history on VPN/remote access appliances is heavy. Review current vendor advisories against the identified versions before Phase 3.\n\n")
+
+                            for domain, info in sorted(tech.items()):
+                                f.write(f"### {domain}\n")
+                                if info.get('server'):
+                                    f.write(f"- **Server:** {info['server']}\n")
+                                if info.get('powered_by'):
+                                    f.write(f"- **Powered By:** {info['powered_by']}\n")
+                                if info.get('detected_technologies'):
+                                    f.write(f"- **Technologies:** {', '.join(info['detected_technologies'])}\n")
+                                if info.get('vpn_appliance'):
+                                    f.write(f"- **VPN Appliance:** {info['vpn_appliance']['class']} ({info['vpn_appliance']['version']})\n")
+                                if info.get('headers'):
+                                    f.write(f"- **Security Headers:**\n")
+                                    for header, value in info['headers'].items():
+                                        if header not in ['Server', 'X-Powered-By']:
+                                            f.write(f"  - {header}: {value}\n")
+                                f.write(f"\n")
+                        else:
+                            f.write(f"No technology stack information collected.\n\n")
+
+                        # LinkedIn Intelligence
+                        f.write(f"## LinkedIn Intelligence\n\n")
+                        linkedin = self.results.get('linkedin_intel', {})
+
+                        companies = linkedin.get('company_info', {}).get('companies', [])
+                        employees = linkedin.get('employees', [])
+
+                        f.write(f"**Companies Found:** {len(companies)}\n")
+                        f.write(f"**Employees Found:** {len(employees)}\n\n")
+
+                        if companies:
+                            f.write(f"### Companies\n\n")
+                            for company in companies:
+                                f.write(f"- **{company['name']}**\n")
+                                if company.get('url'):
+                                    f.write(f"  - {company['url']}\n")
+                            f.write(f"\n")
+
+                        if employees:
+                            f.write(f"### Employees\n\n")
+                            for emp in employees:
+                                title_info = f" - {emp['title']}" if emp.get('title') and emp['title'] != 'Unknown' else ""
+                                f.write(f"- **{emp['name']}**{title_info}\n")
+                                if emp.get('profile_url'):
+                                    f.write(f"  - Profile: {emp['profile_url']}\n")
+                            f.write(f"\n")
+
+                        departments = linkedin.get('departments', [])
+                        if departments:
+                            f.write(f"### Departments Identified\n\n")
+                            for dept in departments:
+                                f.write(f"- {dept.title()}\n")
+                            f.write(f"\n")
+
+                        titles = linkedin.get('titles', {})
+                        if titles:
+                            f.write(f"### Top Job Titles\n\n")
+                            sorted_titles = sorted(titles.items(), key=lambda x: x[1], reverse=True)[:15]
+                            for title, count in sorted_titles:
+                                f.write(f"- {title} ({count})\n")
+                            f.write(f"\n")
+
+                        # Email Addresses
+                        f.write(f"## Email Addresses\n\n")
+                        emails = self.results.get('email_addresses', [])
+                        f.write(f"**Total Found:** {len(emails)}\n\n")
+                        for email in emails:
+                            f.write(f"- {email}\n")
+                        f.write(f"\n")
+
+                        # Breach Data
+                        f.write(f"## Breach Database Results\n\n")
+                        breaches = self.results.get('breach_data', {})
+                        if breaches:
+                            f.write(f"**Accounts with Breaches:** {len(breaches)}\n\n")
+                            for email, breach_list in breaches.items():
+                                f.write(f"### {email}\n")
+                                for breach in breach_list:
+                                    f.write(f"- {breach}\n")
+                                f.write(f"\n")
+                        else:
+                            f.write(f"No compromised credentials found.\n\n")
+
+                        # GitHub Secret Scanning
+                        f.write(f"## GitHub Secret Scanning\n\n")
+                        github = self.results.get('github_secrets', {})
+
+                        if github.get('total_secrets_found', 0) > 0:
+                            f.write(f"**Total Secrets Detected:** {github['total_secrets_found']}\n\n")
+
+                            repos = github.get('repositories', [])
+                            if repos:
+                                f.write(f"### Repositories with Secrets ({len(repos)})\n\n")
+                                for repo in repos:
+                                    f.write(f"#### {repo['repository']}\n")
+                                    f.write(f"- **File:** {repo['file_path']}\n")
+                                    f.write(f"- **URL:** {repo['html_url']}\n")
+                                    f.write(f"- **Secrets Found:**\n")
+                                    for secret in repo['secrets_found']:
+                                        f.write(f"  - {secret['type']}: {secret['count']} match(es)\n")
+                                    f.write(f"\n")
+
+                            issues = github.get('issues', [])
+                            if issues:
+                                f.write(f"### Issues with Secrets ({len(issues)})\n\n")
+                                for issue in issues:
+                                    f.write(f"- **{issue['title']}**\n")
+                                    f.write(f"  - URL: {issue['html_url']}\n")
+                                    f.write(f"  - State: {issue['state']}\n\n")
+                        else:
+                            f.write(f"No secrets found in GitHub repositories.\n\n")
+
+                        # ASN Data
+                        f.write(f"## ASN Enumeration\n\n")
+                        asn_data = self.results.get('asn_data', {})
+
+                        asns = asn_data.get('asn_numbers', [])
+                        if asns:
+                            f.write(f"**ASNs Discovered:** {len(asns)}\n\n")
+                            for asn in asns:
+                                f.write(f"### AS{asn['asn']}\n")
+                                f.write(f"- **Owner:** {asn['owner']}\n")
+                                if asn.get('country'):
+                                    f.write(f"- **Country:** {asn['country']}\n")
+                                f.write(f"\n")
+
+                        ip_ranges = asn_data.get('ip_ranges', [])
+                        if ip_ranges:
+                            f.write(f"### IP Ranges ({len(ip_ranges)})\n\n")
+                            in_scope = [r for r in ip_ranges if r.get('in_scope') or r.get('contains_discovered_ips')]
+                            out_scope = [r for r in ip_ranges if not r.get('in_scope') and not r.get('contains_discovered_ips')]
+
+                            if in_scope:
+                                f.write(f"#### In Authorized Scope ({len(in_scope)})\n\n")
+                                for r in in_scope:
+                                    f.write(f"- {r['prefix']} (AS{r['asn']})\n")
+                                f.write(f"\n")
+
+                            if out_scope:
+                                f.write(f"#### Out of Scope - DO NOT TEST ({len(out_scope)})\n\n")
+                                for r in out_scope:
+                                    f.write(f"- {r['prefix']} (AS{r['asn']})\n")
+                                f.write(f"\n")
+
+                        # S3 Buckets
+                        f.write(f"## AWS S3 Buckets\n\n")
+                        s3 = self.results.get('s3_buckets', {})
+                        found_s3 = s3.get('found', [])
+
+                        if found_s3:
+                            public_s3 = [b for b in found_s3 if b['status'] == 'Public Read']
+                            private_s3 = [b for b in found_s3 if b['status'] == 'Private (Exists)']
+
+                            f.write(f"**Buckets Found:** {len(found_s3)}\n")
+                            f.write(f"**Public:** {len(public_s3)} | **Private:** {len(private_s3)}\n\n")
+
+                            if public_s3:
+                                f.write(f"### Public S3 Buckets\n\n")
+                                for bucket in public_s3:
+                                    f.write(f"#### {bucket['bucket']}\n")
+                                    f.write(f"- **URL:** {bucket['url']}\n")
+                                    if bucket.get('file_count'):
+                                        f.write(f"- **Files:** {bucket['file_count']}\n")
+                                    f.write(f"\n")
+                        else:
+                            f.write(f"No S3 buckets found.\n\n")
+
+                        # Azure Storage
+                        f.write(f"## Azure Storage\n\n")
+                        azure = self.results.get('azure_storage', {})
+                        found_azure = azure.get('found', [])
+
+                        if found_azure:
+                            f.write(f"**Storage Accounts Found:** {len(found_azure)}\n\n")
+                            for storage in found_azure:
+                                f.write(f"### {storage.get('account', 'Unknown')}\n")
+                                f.write(f"- **Container:** {storage.get('container', 'N/A')}\n")
+                                f.write(f"- **Status:** {storage.get('status', 'N/A')}\n")
+                                if storage.get('url'):
+                                    f.write(f"- **URL:** {storage['url']}\n")
+                                f.write(f"\n")
+                        else:
+                            f.write(f"No Azure storage accounts found.\n\n")
+
+                        # GCP Storage
+                        f.write(f"## GCP Storage\n\n")
+                        gcp = self.results.get('gcp_storage', {})
+                        found_gcp = gcp.get('found', [])
+
+                        if found_gcp:
+                            f.write(f"**Buckets Found:** {len(found_gcp)}\n\n")
+                            for bucket in found_gcp:
+                                f.write(f"### {bucket.get('bucket', 'Unknown')}\n")
+                                f.write(f"- **Status:** {bucket.get('status', 'N/A')}\n")
+                                if bucket.get('url'):
+                                    f.write(f"- **URL:** {bucket['url']}\n")
+                                f.write(f"\n")
+                        else:
+                            f.write(f"No GCP storage buckets found.\n\n")
+
+    def _generate_report_template(self, filepath: Path):
+                    """Generate report template with findings"""
+                    with open(filepath, 'w') as f:
+                        f.write(f"# Report Template Content - {self.client_name}\n\n")
+
+                        # Domain Registration Info
+                        f.write("## Target Information\n\n")
+                        domain_whois = self.results.get('scope_validation', {}).get('domain_whois', {})
+
+                        if domain_whois:
+                            if domain_whois.get('organizations'):
+                                f.write(f"**Registered Organization:** {domain_whois['organizations'][0]}\n\n")
+
+                            if domain_whois.get('addresses'):
+                                addr = domain_whois['addresses'][0]
                                 addr_str = f"{addr['street']}, {addr['city']}"
                                 if addr.get('state'):
                                     addr_str += f", {addr['state']}"
@@ -4932,790 +6022,555 @@ class ReconAutomation:
                                     addr_str += f" {addr['postal_code']}"
                                 if addr.get('country'):
                                     addr_str += f", {addr['country']}"
-                                f.write(f"- {addr_str} ({addr.get('source', 'registrant')})\n")
-                            f.write(f"\n")
-
-                        if domain_whois.get('name_servers'):
-                            f.write(f"**Name Servers:**\n")
-                            for ns in domain_whois['name_servers']:
-                                f.write(f"- {ns}\n")
-                            f.write(f"\n")
-
-                        if domain_whois.get('created'):
-                            f.write(f"**Created:** {domain_whois['created']}\n")
-                        if domain_whois.get('expires'):
-                            f.write(f"**Expires:** {domain_whois['expires']}\n")
-                        f.write(f"\n")
-
-                    # IP Range WHOIS
-                    whois = self.results.get('scope_validation', {}).get('whois', {})
-                    if whois:
-                        f.write(f"### IP Range Ownership\n\n")
-                        for ip_range, info in whois.items():
-                            f.write(f"#### {ip_range}\n")
-                            f.write(f"- **Organization:** {info.get('org', 'N/A')}\n")
-                            f.write(f"- **Net Range:** {info.get('netrange', 'N/A')}\n")
-                            f.write(f"- **Country:** {info.get('country', 'N/A')}\n\n")
-
-                    # DNS Enumeration
-                    f.write(f"## DNS Enumeration\n\n")
-                    dns = self.results.get('dns_enumeration', {})
-
-                    resolved_external = dns.get('resolved_external', {})
-                    resolved_internal = dns.get('resolved_internal', {})
-                    resolved = dns.get('resolved', {})
-
-                    f.write(f"**Total Subdomains Discovered:** {dns.get('total_discovered', 0)}\n")
-                    f.write(f"**Resolved (External):** {len(resolved_external)}\n")
-                    f.write(f"**Resolved (Internal):** {len(resolved_internal)}\n\n")
-
-                    # CT Log domains
-                    ct_domains = dns.get('ct_log_domains', [])
-                    if ct_domains:
-                        f.write(f"### Certificate Transparency Log Domains ({len(ct_domains)})\n\n")
-                        f.write(f"Domains discovered via crt.sh and certificate transparency logs:\n\n")
-                        for domain in ct_domains:
-                            f.write(f"- `{domain}`\n")
-                        f.write(f"\n")
-
-                    # Bruteforce domains
-                    brute_domains = dns.get('bruteforce_domains', [])
-                    if brute_domains:
-                        f.write(f"### DNS Bruteforce Domains ({len(brute_domains)})\n\n")
-                        f.write(f"Domains discovered via DNS bruteforce enumeration:\n\n")
-                        for domain in brute_domains:
-                            f.write(f"- `{domain}`\n")
-                        f.write(f"\n")
-
-                    # External resolved subdomains (public IPs)
-                    if resolved_external:
-                        f.write(f"### External Subdomains ({len(resolved_external)})\n\n")
-                        f.write(f"Subdomains resolving to public IP addresses:\n\n")
-                        for subdomain, ips in sorted(resolved_external.items()):
-                            f.write(f"- `{subdomain}` → {', '.join(ips)}\n")
-                        f.write(f"\n")
-
-                    # Internal resolved subdomains (private IPs) - Information Disclosure
-                    if resolved_internal:
-                        f.write(f"### Internal Subdomains ({len(resolved_internal)}) ⚠️ INFORMATION DISCLOSURE\n\n")
-                        f.write(f"**Finding:** Internal hostnames exposed in public DNS records.\n\n")
-                        f.write(f"**Risk:** These subdomains resolve to private/internal IP addresses (RFC 1918), ")
-                        f.write(f"revealing internal network structure to external attackers. This information can be used to:\n\n")
-                        f.write(f"- Map internal network topology\n")
-                        f.write(f"- Identify internal naming conventions\n")
-                        f.write(f"- Target systems during internal penetration testing\n")
-                        f.write(f"- Craft more convincing phishing attacks\n\n")
-                        f.write(f"**Affected Subdomains:**\n\n")
-                        for subdomain, ips in sorted(resolved_internal.items()):
-                            f.write(f"- `{subdomain}` → {', '.join(ips)}\n")
-                        f.write(f"\n")
-                        f.write(f"**Recommendation:** Remove internal DNS records from public-facing DNS servers ")
-                        f.write(f"or implement split-horizon DNS to prevent internal hostname disclosure.\n\n")
-
-                    # Fallback to old resolved format if new format not available
-                    if not resolved_external and not resolved_internal and resolved:
-                        f.write(f"### Resolved Subdomains ({len(resolved)})\n\n")
-                        f.write(f"Subdomains that successfully resolved to IP addresses:\n\n")
-                        for subdomain, ips in sorted(resolved.items()):
-                            f.write(f"- `{subdomain}` → {', '.join(ips)}\n")
-                        f.write(f"\n")
-
-                    # Unresolved domains
-                    unresolved = dns.get('unresolved', [])
-                    if unresolved:
-                        f.write(f"### Unresolved Domains ({len(unresolved)})\n\n")
-                        f.write(f"Domains that did not resolve (may be expired, internal, or misconfigured):\n\n")
-                        for domain in unresolved[:100]:
-                            f.write(f"- `{domain}`\n")
-                        if len(unresolved) > 100:
-                            f.write(f"- ... and {len(unresolved) - 100} more\n")
-                        f.write(f"\n")
-
-                    # Infrastructure Summary (from WHOIS)
-                    infra_summary = dns.get('infrastructure_summary', {})
-                    if infra_summary:
-                        f.write(f"### Infrastructure Summary\n\n")
-                        f.write(f"Organizations identified from IP WHOIS lookups:\n\n")
-                        for org, data in sorted(infra_summary.items(), key=lambda x: len(x[1].get('ips', [])), reverse=True):
-                            ip_count = len(data.get('ips', []))
-                            f.write(f"#### {org}\n")
-                            f.write(f"- **IPs:** {ip_count}\n")
-                            if data.get('country'):
-                                f.write(f"- **Country:** {data['country']}\n")
-                            if data.get('netranges'):
-                                f.write(f"- **Network Ranges:** {', '.join(data['netranges'])}\n")
-                            f.write(f"\n")
-
-                    # Subdomain Takeover
-                    f.write(f"## Subdomain Takeover Vulnerabilities\n\n")
-                    takeovers = self.results.get('subdomain_takeovers', [])
-                    if takeovers:
-                        f.write(f"**Potentially Vulnerable Subdomains:** {len(takeovers)}\n\n")
-                        for vuln in takeovers:
-                            f.write(f"### {vuln['subdomain']}\n")
-                            f.write(f"- **Service:** {vuln['service']}\n")
-                            f.write(f"- **Confidence:** {vuln.get('confidence', 'Unknown')}\n")
-                            if vuln.get('cname'):
-                                f.write(f"- **CNAME:** {', '.join(vuln['cname'])}\n")
-                            f.write(f"- **Risk:** Subdomain may be claimable by attacker\n\n")
-                    else:
-                        f.write(f"No subdomain takeover vulnerabilities detected.\n\n")
-
-                    # Technology Stack
-                    f.write(f"## Technology Stack\n\n")
-                    tech = self.results.get('technology_stack', {})
-                    if tech:
-                        f.write(f"**Systems Analyzed:** {len(tech)}\n\n")
-                        for domain, info in sorted(tech.items()):
-                            f.write(f"### {domain}\n")
-                            if info.get('server'):
-                                f.write(f"- **Server:** {info['server']}\n")
-                            if info.get('powered_by'):
-                                f.write(f"- **Powered By:** {info['powered_by']}\n")
-                            if info.get('detected_technologies'):
-                                f.write(f"- **Technologies:** {', '.join(info['detected_technologies'])}\n")
-                            if info.get('headers'):
-                                f.write(f"- **Security Headers:**\n")
-                                for header, value in info['headers'].items():
-                                    if header not in ['Server', 'X-Powered-By']:
-                                        f.write(f"  - {header}: {value}\n")
-                            f.write(f"\n")
-                    else:
-                        f.write(f"No technology stack information collected.\n\n")
-
-                    # LinkedIn Intelligence
-                    f.write(f"## LinkedIn Intelligence\n\n")
-                    linkedin = self.results.get('linkedin_intel', {})
-
-                    companies = linkedin.get('company_info', {}).get('companies', [])
-                    employees = linkedin.get('employees', [])
-
-                    f.write(f"**Companies Found:** {len(companies)}\n")
-                    f.write(f"**Employees Found:** {len(employees)}\n\n")
-
-                    if companies:
-                        f.write(f"### Companies\n\n")
-                        for company in companies:
-                            f.write(f"- **{company['name']}**\n")
-                            if company.get('url'):
-                                f.write(f"  - {company['url']}\n")
-                        f.write(f"\n")
-
-                    if employees:
-                        f.write(f"### Employees\n\n")
-                        for emp in employees:
-                            title_info = f" - {emp['title']}" if emp.get('title') and emp['title'] != 'Unknown' else ""
-                            f.write(f"- **{emp['name']}**{title_info}\n")
-                            if emp.get('profile_url'):
-                                f.write(f"  - Profile: {emp['profile_url']}\n")
-                        f.write(f"\n")
-
-                    departments = linkedin.get('departments', [])
-                    if departments:
-                        f.write(f"### Departments Identified\n\n")
-                        for dept in departments:
-                            f.write(f"- {dept.title()}\n")
-                        f.write(f"\n")
-
-                    titles = linkedin.get('titles', {})
-                    if titles:
-                        f.write(f"### Top Job Titles\n\n")
-                        sorted_titles = sorted(titles.items(), key=lambda x: x[1], reverse=True)[:15]
-                        for title, count in sorted_titles:
-                            f.write(f"- {title} ({count})\n")
-                        f.write(f"\n")
-
-                    # Email Addresses
-                    f.write(f"## Email Addresses\n\n")
-                    emails = self.results.get('email_addresses', [])
-                    f.write(f"**Total Found:** {len(emails)}\n\n")
-                    for email in emails:
-                        f.write(f"- {email}\n")
-                    f.write(f"\n")
-
-                    # Breach Data
-                    f.write(f"## Breach Database Results\n\n")
-                    breaches = self.results.get('breach_data', {})
-                    if breaches:
-                        f.write(f"**Accounts with Breaches:** {len(breaches)}\n\n")
-                        for email, breach_list in breaches.items():
-                            f.write(f"### {email}\n")
-                            for breach in breach_list:
-                                f.write(f"- {breach}\n")
-                            f.write(f"\n")
-                    else:
-                        f.write(f"No compromised credentials found.\n\n")
-
-                    # GitHub Secret Scanning
-                    f.write(f"## GitHub Secret Scanning\n\n")
-                    github = self.results.get('github_secrets', {})
-
-                    if github.get('total_secrets_found', 0) > 0:
-                        f.write(f"**Total Secrets Detected:** {github['total_secrets_found']}\n\n")
-
-                        repos = github.get('repositories', [])
-                        if repos:
-                            f.write(f"### Repositories with Secrets ({len(repos)})\n\n")
-                            for repo in repos:
-                                f.write(f"#### {repo['repository']}\n")
-                                f.write(f"- **File:** {repo['file_path']}\n")
-                                f.write(f"- **URL:** {repo['html_url']}\n")
-                                f.write(f"- **Secrets Found:**\n")
-                                for secret in repo['secrets_found']:
-                                    f.write(f"  - {secret['type']}: {secret['count']} match(es)\n")
-                                f.write(f"\n")
-
-                        issues = github.get('issues', [])
-                        if issues:
-                            f.write(f"### Issues with Secrets ({len(issues)})\n\n")
-                            for issue in issues:
-                                f.write(f"- **{issue['title']}**\n")
-                                f.write(f"  - URL: {issue['html_url']}\n")
-                                f.write(f"  - State: {issue['state']}\n\n")
-                    else:
-                        f.write(f"No secrets found in GitHub repositories.\n\n")
-
-                    # ASN Data
-                    f.write(f"## ASN Enumeration\n\n")
-                    asn_data = self.results.get('asn_data', {})
-
-                    asns = asn_data.get('asn_numbers', [])
-                    if asns:
-                        f.write(f"**ASNs Discovered:** {len(asns)}\n\n")
-                        for asn in asns:
-                            f.write(f"### AS{asn['asn']}\n")
-                            f.write(f"- **Owner:** {asn['owner']}\n")
-                            if asn.get('country'):
-                                f.write(f"- **Country:** {asn['country']}\n")
-                            f.write(f"\n")
-
-                    ip_ranges = asn_data.get('ip_ranges', [])
-                    if ip_ranges:
-                        f.write(f"### IP Ranges ({len(ip_ranges)})\n\n")
-                        in_scope = [r for r in ip_ranges if r.get('in_scope') or r.get('contains_discovered_ips')]
-                        out_scope = [r for r in ip_ranges if not r.get('in_scope') and not r.get('contains_discovered_ips')]
-
-                        if in_scope:
-                            f.write(f"#### In Authorized Scope ({len(in_scope)})\n\n")
-                            for r in in_scope:
-                                f.write(f"- {r['prefix']} (AS{r['asn']})\n")
-                            f.write(f"\n")
-
-                        if out_scope:
-                            f.write(f"#### Out of Scope - DO NOT TEST ({len(out_scope)})\n\n")
-                            for r in out_scope:
-                                f.write(f"- {r['prefix']} (AS{r['asn']})\n")
-                            f.write(f"\n")
-
-                    # S3 Buckets
-                    f.write(f"## AWS S3 Buckets\n\n")
-                    s3 = self.results.get('s3_buckets', {})
-                    found_s3 = s3.get('found', [])
-
-                    if found_s3:
-                        public_s3 = [b for b in found_s3 if b['status'] == 'Public Read']
-                        private_s3 = [b for b in found_s3 if b['status'] == 'Private (Exists)']
-
-                        f.write(f"**Buckets Found:** {len(found_s3)}\n")
-                        f.write(f"**Public:** {len(public_s3)} | **Private:** {len(private_s3)}\n\n")
-
-                        if public_s3:
-                            f.write(f"### Public S3 Buckets\n\n")
-                            for bucket in public_s3:
-                                f.write(f"#### {bucket['bucket']}\n")
-                                f.write(f"- **URL:** {bucket['url']}\n")
-                                if bucket.get('file_count'):
-                                    f.write(f"- **Files:** {bucket['file_count']}\n")
-                                f.write(f"\n")
-                    else:
-                        f.write(f"No S3 buckets found.\n\n")
-
-                    # Azure Storage
-                    f.write(f"## Azure Storage\n\n")
-                    azure = self.results.get('azure_storage', {})
-                    found_azure = azure.get('found', [])
-
-                    if found_azure:
-                        f.write(f"**Storage Accounts Found:** {len(found_azure)}\n\n")
-                        for storage in found_azure:
-                            f.write(f"### {storage.get('account', 'Unknown')}\n")
-                            f.write(f"- **Container:** {storage.get('container', 'N/A')}\n")
-                            f.write(f"- **Status:** {storage.get('status', 'N/A')}\n")
-                            if storage.get('url'):
-                                f.write(f"- **URL:** {storage['url']}\n")
-                            f.write(f"\n")
-                    else:
-                        f.write(f"No Azure storage accounts found.\n\n")
-
-                    # GCP Storage
-                    f.write(f"## GCP Storage\n\n")
-                    gcp = self.results.get('gcp_storage', {})
-                    found_gcp = gcp.get('found', [])
-
-                    if found_gcp:
-                        f.write(f"**Buckets Found:** {len(found_gcp)}\n\n")
-                        for bucket in found_gcp:
-                            f.write(f"### {bucket.get('bucket', 'Unknown')}\n")
-                            f.write(f"- **Status:** {bucket.get('status', 'N/A')}\n")
-                            if bucket.get('url'):
-                                f.write(f"- **URL:** {bucket['url']}\n")
-                            f.write(f"\n")
-                    else:
-                        f.write(f"No GCP storage buckets found.\n\n")
-
-    def _generate_report_template(self, filepath: Path):
-                """Generate report template with findings"""
-                with open(filepath, 'w') as f:
-                    f.write(f"# Report Template Content - {self.client_name}\n\n")
-
-                    # Domain Registration Info
-                    f.write("## Target Information\n\n")
-                    domain_whois = self.results.get('scope_validation', {}).get('domain_whois', {})
-
-                    if domain_whois:
-                        if domain_whois.get('organizations'):
-                            f.write(f"**Registered Organization:** {domain_whois['organizations'][0]}\n\n")
-
-                        if domain_whois.get('addresses'):
-                            addr = domain_whois['addresses'][0]
-                            addr_str = f"{addr['street']}, {addr['city']}"
-                            if addr.get('state'):
-                                addr_str += f", {addr['state']}"
-                            if addr.get('postal_code'):
-                                addr_str += f" {addr['postal_code']}"
-                            if addr.get('country'):
-                                addr_str += f", {addr['country']}"
-                            f.write(f"**Physical Location:** {addr_str}\n\n")
-
-                        if domain_whois.get('phones'):
-                            f.write(f"**Contact Phone:** {domain_whois['phones'][0]}\n\n")
-
-                    # Ownership Verification
-                    f.write("### Ownership Verification\n\n")
-                    whois = self.results.get('scope_validation', {}).get('whois', {})
-                    if whois:
-                        for ip_range, info in whois.items():
-                            org = info.get('org', 'Unknown')
-                            f.write(f"• {ip_range} - Confirmed owned by {org}\n")
-                        f.write("\n")
-                    else:
-                        f.write("No IP ranges provided for ownership verification.\n\n")
-
-                    # DNS Enumeration Section
-                    f.write("## Reconnaissance and OSINT\n\n")
-                    f.write("### Finding the External Footprint\n\n")
-
-                    dns = self.results.get('dns_enumeration', {})
-                    total = dns.get('total_discovered', 0)
-                    resolved_external = dns.get('resolved_external', {})
-                    resolved_internal = dns.get('resolved_internal', {})
-                    resolved = dns.get('resolved', {})
-
-                    f.write(f"DNS enumeration revealed {total} subdomains. ")
-                    if resolved_external or resolved_internal:
-                        f.write(f"Of these, {len(resolved_external)} resolve to external IPs and {len(resolved_internal)} resolve to internal IPs.\n\n")
-                    else:
-                        f.write(f"This mapped out what was reachable from the internet.\n\n")
-
-                    # Use external resolved if available, fall back to resolved
-                    display_resolved = resolved_external if resolved_external else resolved
-                    if display_resolved:
-                        f.write("Key external subdomains identified:\n")
-                        for subdomain in sorted(display_resolved.keys())[:10]:
-                            ips = display_resolved[subdomain]
-                            f.write(f"• {subdomain} ({', '.join(ips)})\n")
-                        f.write("\n")
-
-                    # Internal DNS Information Disclosure
-                    if resolved_internal:
-                        f.write("### Internal DNS Information Disclosure\n\n")
-                        f.write(f"**Finding:** {len(resolved_internal)} internal hostnames exposed in public DNS.\n\n")
-                        f.write("During DNS enumeration, multiple subdomains were discovered that resolve to private ")
-                        f.write("RFC 1918 IP addresses (10.x.x.x, 172.16-31.x.x, 192.168.x.x). This constitutes an ")
-                        f.write("information disclosure vulnerability as it reveals:\n\n")
-                        f.write("• Internal network addressing scheme\n")
-                        f.write("• Internal hostname naming conventions\n")
-                        f.write("• Potential internal services and their purposes\n\n")
-                        f.write("**Affected Systems (sample):**\n\n")
-                        for subdomain in sorted(resolved_internal.keys())[:15]:
-                            ips = resolved_internal[subdomain]
-                            f.write(f"• {subdomain} → {', '.join(ips)}\n")
-                        if len(resolved_internal) > 15:
-                            f.write(f"• ... and {len(resolved_internal) - 15} more\n")
-                        f.write("\n")
-                        f.write("**Recommendation:** Implement split-horizon DNS to prevent internal records from being ")
-                        f.write("served to external queries, or remove internal records from public DNS zones entirely.\n\n")
-
-                    # Subdomain Takeover
-                    takeovers = self.results.get('subdomain_takeovers', [])
-                    if takeovers:
-                        f.write("### Subdomain Takeover Vulnerabilities\n\n")
-                        f.write(f"Analysis identified {len(takeovers)} subdomain(s) potentially vulnerable to takeover attacks:\n\n")
-                        for vuln in takeovers:
-                            f.write(f"• {vuln['subdomain']} - Points to unclaimed {vuln['service']} resource\n")
-                        f.write("\n")
-                        f.write("Subdomain takeover allows attackers to host malicious content on the organization's domain, ")
-                        f.write("enabling phishing campaigns, malware distribution, or reputation damage. These subdomains should be ")
-                        f.write("either claimed by the organization or removed from DNS records.\n\n")
-
-                    # Technology Stack Section
-                    f.write("### Understanding the Technology Stack\n\n")
-                    tech = self.results.get('technology_stack', {})
-
-                    if tech:
-                        f.write("Public sources and SSL certificates revealed the organization uses:\n")
-                        all_tech = set()
-                        all_servers = set()
-
-                        for domain, info in tech.items():
-                            if info.get('server'):
-                                all_servers.add(info['server'])
-                            if info.get('detected_technologies'):
-                                all_tech.update(info['detected_technologies'])
-
-                        if all_servers:
-                            f.write(f"• Web Servers: {', '.join(all_servers)}\n")
-                        if all_tech:
-                            f.write(f"• Technologies: {', '.join(all_tech)}\n")
-                        f.write("\n")
-
-                    # LinkedIn Intelligence
-                    f.write("### Employee Enumeration via LinkedIn\n\n")
-                    linkedin = self.results.get('linkedin_intel', {})
-                    employees = linkedin.get('employees', [])
-
-                    if employees:
-                        f.write(f"LinkedIn reconnaissance identified {len(employees)} employee accounts associated with the organization.\n\n")
-                        f.write("This intelligence enables targeted phishing campaigns and password spraying attacks against valid accounts.\n\n")
-                    else:
-                        f.write("Limited employee information was gathered through public LinkedIn sources.\n\n")
-
-                    # Email Addresses Section
-                    f.write("### Identifying Valid User Accounts\n\n")
-                    emails = self.results.get('email_addresses', [])
-
-                    if emails:
-                        f.write(f"Public sources revealed {len(emails)} email addresses:\n\n")
-                        for email in emails[:10]:
-                            f.write(f"• {email}\n")
-                        if len(emails) > 10:
-                            f.write(f"• ... and {len(emails) - 10} more\n")
-                        f.write("\n")
-                    else:
-                        f.write("No email addresses were discovered through passive reconnaissance.\n\n")
-
-                    # Breach Data Section
-                    f.write("### Searching for Compromised Credentials\n\n")
-                    breaches = self.results.get('breach_data', {})
-
-                    if breaches:
-                        f.write(f"Breach databases were checked for client email addresses. {len(breaches)} accounts were found with exposed passwords:\n\n")
-                        for email, breach_list in list(breaches.items())[:5]:
-                            f.write(f"• {email} - Found in: {', '.join(breach_list[:3])}\n")
-                        f.write("\n")
-                        f.write("These credentials became immediate testing priorities as users frequently reuse passwords across work and personal accounts.\n\n")
-                    else:
-                        f.write("No exposed credentials were found in available breach databases.\n\n")
-
-                    # GitHub Secret Scanning
-                    f.write("### GitHub Secret Exposure\n\n")
-                    github = self.results.get('github_secrets', {})
-
-                    if github.get('total_secrets_found', 0) > 0:
-                        repos = github.get('repositories', [])
-                        issues = github.get('issues', [])
-                        commits = github.get('commits', [])
-
-                        f.write(f"GitHub scanning identified {github['total_secrets_found']} potential secrets across {len(repos)} repositories, ")
-                        f.write(f"{len(issues)} issues, and {len(commits)} commits.\n\n")
-
-                        if repos:
-                            f.write("Repositories containing sensitive data:\n")
-                            for repo in repos[:5]:
-                                f.write(f"• {repo['repository']}/{repo['file_path']}\n")
+                                f.write(f"**Physical Location:** {addr_str}\n\n")
+
+                            if domain_whois.get('phones'):
+                                f.write(f"**Contact Phone:** {domain_whois['phones'][0]}\n\n")
+
+                        # Ownership Verification
+                        f.write("### Ownership Verification\n\n")
+                        whois = self.results.get('scope_validation', {}).get('whois', {})
+                        if whois:
+                            for ip_range, info in whois.items():
+                                org = info.get('org', 'Unknown')
+                                f.write(f"- {ip_range} - Confirmed owned by {org}\n")
                             f.write("\n")
-
-                        f.write("Exposed secrets in public repositories represent critical security vulnerabilities, potentially providing ")
-                        f.write("direct access to infrastructure, databases, and third-party services.\n\n")
-                    else:
-                        f.write("No secrets were discovered in public GitHub repositories associated with the organization.\n\n")
-
-                    # ASN Enumeration
-                    f.write("### Network Infrastructure (ASN Enumeration)\n\n")
-                    asn_data = self.results.get('asn_data', {})
-
-                    asns = asn_data.get('asn_numbers', [])
-                    ip_ranges = asn_data.get('ip_ranges', [])
-
-                    if asns:
-                        f.write(f"ASN enumeration identified {len(asns)} autonomous system(s) associated with the organization:\n\n")
-                        for asn in asns:
-                            f.write(f"• AS{asn['asn']} - {asn['owner']}\n")
-                        f.write("\n")
-
-                    if ip_ranges:
-                        in_scope = [r for r in ip_ranges if r.get('in_scope') or r.get('contains_discovered_ips')]
-                        out_scope = [r for r in ip_ranges if not r.get('in_scope') and not r.get('contains_discovered_ips')]
-
-                        f.write(f"Total IP ranges discovered: {len(ip_ranges)}\n")
-                        f.write(f"• Ranges within authorized scope: {len(in_scope)}\n")
-                        f.write(f"• Ranges outside authorized scope: {len(out_scope)}\n\n")
-
-                        if out_scope:
-                            f.write("Additional IP ranges were identified that belong to the organization but fall outside the authorized testing scope. ")
-                            f.write("These ranges were documented but not tested.\n\n")
-
-                    # Cloud Storage Enumeration Section
-                    f.write("### Cloud Storage Enumeration\n\n")
-
-                    s3 = self.results.get('s3_buckets', {})
-                    azure = self.results.get('azure_storage', {})
-                    gcp = self.results.get('gcp_storage', {})
-
-                    found_s3 = s3.get('found', [])
-                    found_azure = azure.get('found', [])
-                    found_gcp = gcp.get('found', [])
-
-                    total_cloud = len(found_s3) + len(found_azure) + len(found_gcp)
-
-                    if total_cloud > 0:
-                        public_s3 = [b for b in found_s3 if b['status'] == 'Public Read']
-                        public_azure = [s for s in found_azure if s['status'] == 'Public Read']
-                        public_gcp = [b for b in found_gcp if b['status'] == 'Public Read']
-                        total_public = len(public_s3) + len(public_azure) + len(public_gcp)
-
-                        f.write(f"Cloud storage enumeration discovered {total_cloud} storage resource(s):\n")
-                        f.write(f"• AWS S3: {len(found_s3)} ({len(public_s3)} public)\n")
-                        f.write(f"• Azure Storage: {len(found_azure)} ({len(public_azure)} public)\n")
-                        f.write(f"• GCP Storage: {len(found_gcp)} ({len(public_gcp)} public)\n\n")
-
-                        if total_public > 0:
-                            f.write(f"**{total_public} publicly accessible cloud storage resource(s) identified.**\n\n")
-                            f.write("Public cloud storage represents a critical data exposure risk. Unauthenticated access allows ")
-                            f.write("any internet user to view, and potentially download, sensitive organizational data.\n\n")
                         else:
-                            f.write("While cloud storage resources were discovered, all were properly configured with private access controls.\n\n")
-                    else:
-                        f.write("No cloud storage resources were discovered during enumeration.\n\n")
+                            f.write("No IP ranges provided for ownership verification.\n\n")
 
-                    # Network Enumeration Section
-                    f.write("## Enumeration and Mapping\n\n")
-                    scan = self.results.get('network_scan', {})
+                        # DNS Enumeration Section
+                        f.write("## Reconnaissance and OSINT\n\n")
+                        f.write("### Finding the External Footprint\n\n")
 
-                    if scan:
-                        total_hosts = len(scan)
-                        total_ports = sum(len(ports) for ports in scan.values())
+                        dns = self.results.get('dns_enumeration', {})
+                        total = dns.get('total_discovered', 0)
+                        resolved_external = dns.get('resolved_external', {})
+                        resolved_internal = dns.get('resolved_internal', {})
+                        resolved = dns.get('resolved', {})
 
-                        f.write(f"Network scanning revealed {total_hosts} live hosts with {total_ports} open ports.\n\n")
+                        f.write(f"DNS enumeration revealed {total} subdomains. ")
+                        if resolved_external or resolved_internal:
+                            f.write(f"Of these, {len(resolved_external)} resolve to external IPs and {len(resolved_internal)} resolve to internal IPs.\n\n")
+                        else:
+                            f.write(f"This mapped out what was reachable from the internet.\n\n")
 
-                        interesting_services = []
-                        for host, ports in scan.items():
-                            for port_num, port_info in ports.items():
-                                service = port_info.get('service', 'unknown')
-                                if any(keyword in service.lower() for keyword in ['vpn', 'ssh', 'rdp', 'http', 'ftp', 'smtp']):
-                                    interesting_services.append(f"{host}:{port_num} ({service})")
-
-                        if interesting_services:
-                            f.write("Most promising targets for further investigation:\n")
-                            for service in interesting_services[:10]:
-                                f.write(f"• {service}\n")
+                        # Use external resolved if available, fall back to resolved
+                        display_resolved = resolved_external if resolved_external else resolved
+                        if display_resolved:
+                            f.write("Key external subdomains identified:\n")
+                            for subdomain in sorted(display_resolved.keys())[:10]:
+                                ips = display_resolved[subdomain]
+                                f.write(f"- {subdomain} ({', '.join(ips)})\n")
                             f.write("\n")
+
+                        # Internal DNS Information Disclosure
+                        if resolved_internal:
+                            f.write("### Internal DNS Information Disclosure\n\n")
+                            f.write(f"**Finding:** {len(resolved_internal)} internal hostnames exposed in public DNS.\n\n")
+                            f.write("During DNS enumeration, multiple subdomains were discovered that resolve to private ")
+                            f.write("RFC 1918 IP addresses (10.x.x.x, 172.16-31.x.x, 192.168.x.x). This constitutes an ")
+                            f.write("information disclosure vulnerability as it reveals:\n\n")
+                            f.write("- Internal network addressing scheme\n")
+                            f.write("- Internal hostname naming conventions\n")
+                            f.write("- Potential internal services and their purposes\n\n")
+                            f.write("**Affected Systems (sample):**\n\n")
+                            for subdomain in sorted(resolved_internal.keys())[:15]:
+                                ips = resolved_internal[subdomain]
+                                f.write(f"- {subdomain} -> {', '.join(ips)}\n")
+                            if len(resolved_internal) > 15:
+                                f.write(f"- ... and {len(resolved_internal) - 15} more\n")
+                            f.write("\n")
+                            f.write("**Recommendation:** Implement split-horizon DNS to prevent internal records from being ")
+                            f.write("served to external queries, or remove internal records from public DNS zones entirely.\n\n")
+
+                        # M365/Azure AD Tenant Attribution
+                        m365 = self.results.get('m365_tenant', {})
+                        if m365 and m365.get('is_m365'):
+                            f.write("### M365/Azure AD Tenant Attribution\n\n")
+                            brand = m365.get('federation_brand') or self.client_name
+                            namespace = m365.get('namespace_type', 'Unknown')
+
+                            f.write(f"Cloud identity reconnaissance confirmed the target operates a Microsoft 365 / Azure AD ")
+                            f.write(f"tenant. The tenant was attributed through publicly accessible Microsoft authentication ")
+                            f.write(f"endpoints which disclose tenant identifiers, brand information, and federation posture.\n\n")
+
+                            f.write(f"- Tenant ID: {m365.get('tenant_id', 'Unknown')}\n")
+                            if m365.get('tenant_region'):
+                                f.write(f"- Tenant Region: {m365['tenant_region']}\n")
+                            f.write(f"- Federation Brand: {brand}\n")
+                            f.write(f"- Namespace Type: {namespace}\n")
+                            if m365.get('cloud_instance'):
+                                f.write(f"- Cloud Instance: {m365['cloud_instance']}\n")
+                            f.write("\n")
+
+                            if namespace == 'Federated':
+                                f.write("The tenant is configured for federated authentication, indicating an on-premises ")
+                                f.write("identity provider (typically ADFS) handles user authentication. ")
+                                if m365.get('federation_host'):
+                                    f.write(f"The federation endpoint resides at {m365['federation_host']}. ")
+                                f.write("Federated tenants present additional external attack surface through the on-premises ")
+                                f.write("IdP, which becomes a primary target for credential attacks, version-specific ")
+                                f.write("vulnerabilities, and authentication bypass research.\n\n")
+                            elif namespace == 'Managed':
+                                f.write("The tenant uses cloud-native managed authentication. The primary external ")
+                                f.write("authentication surface is the M365 sign-in endpoint, which becomes the target ")
+                                f.write("for password spray attacks, valid-user enumeration, and conditional access ")
+                                f.write("policy assessment.\n\n")
+
+                        # ADFS Endpoint Discovery
+                        adfs = self.results.get('adfs', {})
+                        hosts_probed = adfs.get('hosts_probed', [])
+                        reachable_hosts = [h for h in hosts_probed if h.get('reachable')]
+
+                        if reachable_hosts:
+                            f.write("### ADFS Identity Provider Reconnaissance\n\n")
+                            version_info = adfs.get('version_info', {})
+
+                            f.write(f"ADFS endpoint reconnaissance against the federated identity provider revealed ")
+                            f.write(f"the version, supported authentication protocols, and federation metadata. This ")
+                            f.write(f"information establishes the attack surface for the on-premises identity provider.\n\n")
+
+                            if version_info.get('adfs_version'):
+                                f.write(f"The deployed ADFS version was identified as {version_info['adfs_version']}")
+                                if version_info.get('build_number'):
+                                    f.write(f" (build {version_info['build_number']})")
+                                f.write(". ")
+
+                            protocols = set()
+                            for host_data in reachable_hosts:
+                                for endpoint_data in host_data.get('endpoints', {}).values():
+                                    if endpoint_data.get('supported_protocols'):
+                                        protocols.update(endpoint_data['supported_protocols'])
+                                    if endpoint_data.get('ws_trust_supported'):
+                                        protocols.add('WS-Trust MEX')
+                                    if endpoint_data.get('oauth2_supported'):
+                                        protocols.add('OAuth2')
+
+                            if protocols:
+                                f.write(f"Supported federation protocols include: {', '.join(sorted(protocols))}. ")
+
+                            fed_metadata = adfs.get('federation_metadata', {})
+                            if fed_metadata.get('entity_id'):
+                                f.write(f"The federation entity identifier was disclosed as {fed_metadata['entity_id']}. ")
+
+                            f.write("\n\n")
+                            f.write("ADFS version disclosure provides the input for vulnerability analysis against the ")
+                            f.write("identity provider. The on-premises IdP is a high-value target as compromise can lead ")
+                            f.write("to credential capture, golden SAML attacks, or authentication bypass affecting all ")
+                            f.write("federated cloud services. Current vendor advisories should be reviewed against the ")
+                            f.write("identified version before active testing.\n\n")
+
+                        # Subdomain Takeover
+                        takeovers = self.results.get('subdomain_takeovers', [])
+                        if takeovers:
+                            f.write("### Subdomain Takeover Vulnerabilities\n\n")
+                            f.write(f"Analysis identified {len(takeovers)} subdomain(s) potentially vulnerable to takeover attacks:\n\n")
+                            for vuln in takeovers:
+                                f.write(f"- {vuln['subdomain']} - Points to unclaimed {vuln['service']} resource\n")
+                            f.write("\n")
+                            f.write("Subdomain takeover allows attackers to host malicious content on the organization's domain, ")
+                            f.write("enabling phishing campaigns, malware distribution, or reputation damage. These subdomains should be ")
+                            f.write("either claimed by the organization or removed from DNS records.\n\n")
+
+                        # Technology Stack Section
+                        f.write("### Understanding the Technology Stack\n\n")
+                        tech = self.results.get('technology_stack', {})
+
+                        if tech:
+                            f.write("Public sources and SSL certificates revealed the organization uses:\n")
+                            all_tech = set()
+                            all_servers = set()
+
+                            for domain, info in tech.items():
+                                if info.get('server'):
+                                    all_servers.add(info['server'])
+                                if info.get('detected_technologies'):
+                                    all_tech.update(info['detected_technologies'])
+
+                            if all_servers:
+                                f.write(f"- Web Servers: {', '.join(all_servers)}\n")
+                            if all_tech:
+                                f.write(f"- Technologies: {', '.join(all_tech)}\n")
+                            f.write("\n")
+
+                            # Remote access appliance narrative
+                            appliance_hosts = {h: info for h, info in tech.items() if info.get('vpn_appliance')}
+                            if appliance_hosts:
+                                f.write("### Remote Access Appliance Identification\n\n")
+                                f.write(f"Technology fingerprinting identified {len(appliance_hosts)} remote access appliance(s) ")
+                                f.write("exposed to the internet. These appliances handle VPN, remote desktop, or federated ")
+                                f.write("authentication and represent high-value targets given the heavy CVE history on this class of devices.\n\n")
+
+                                for host, info in sorted(appliance_hosts.items()):
+                                    appliance = info['vpn_appliance']
+                                    version_part = f" version {appliance['version']}" if appliance['version'] != 'Unknown' else ""
+                                    f.write(f"- {host} - {appliance['class']}{version_part}\n")
+                                f.write("\n")
+                                f.write("Identified appliance versions should be cross-referenced against current vendor advisories. ")
+                                f.write("Common high-yield CVE classes on these devices include pre-authentication remote code execution, ")
+                                f.write("authentication bypass, and path traversal vulnerabilities.\n\n")
+
+                        # LinkedIn Intelligence
+                        f.write("### Employee Enumeration via LinkedIn\n\n")
+                        linkedin = self.results.get('linkedin_intel', {})
+                        employees = linkedin.get('employees', [])
+
+                        if employees:
+                            f.write(f"LinkedIn reconnaissance identified {len(employees)} employee accounts associated with the organization.\n\n")
+                            f.write("This intelligence enables targeted phishing campaigns and password spraying attacks against valid accounts.\n\n")
+                        else:
+                            f.write("Limited employee information was gathered through public LinkedIn sources.\n\n")
+
+                        # Email Addresses Section
+                        f.write("### Identifying Valid User Accounts\n\n")
+                        emails = self.results.get('email_addresses', [])
+
+                        if emails:
+                            f.write(f"Public sources revealed {len(emails)} email addresses:\n\n")
+                            for email in emails[:10]:
+                                f.write(f"- {email}\n")
+                            if len(emails) > 10:
+                                f.write(f"- ... and {len(emails) - 10} more\n")
+                            f.write("\n")
+                        else:
+                            f.write("No email addresses were discovered through passive reconnaissance.\n\n")
+
+                        # Breach Data Section
+                        f.write("### Searching for Compromised Credentials\n\n")
+                        breaches = self.results.get('breach_data', {})
+
+                        if breaches:
+                            f.write(f"Breach databases were checked for client email addresses. {len(breaches)} accounts were found with exposed passwords:\n\n")
+                            for email, breach_list in list(breaches.items())[:5]:
+                                f.write(f"- {email} - Found in: {', '.join(breach_list[:3])}\n")
+                            f.write("\n")
+                            f.write("These credentials became immediate testing priorities as users frequently reuse passwords across work and personal accounts.\n\n")
+                        else:
+                            f.write("No exposed credentials were found in available breach databases.\n\n")
+
+                        # GitHub Secret Scanning
+                        f.write("### GitHub Secret Exposure\n\n")
+                        github = self.results.get('github_secrets', {})
+
+                        if github.get('total_secrets_found', 0) > 0:
+                            repos = github.get('repositories', [])
+                            issues = github.get('issues', [])
+                            commits = github.get('commits', [])
+
+                            f.write(f"GitHub scanning identified {github['total_secrets_found']} potential secrets across {len(repos)} repositories, ")
+                            f.write(f"{len(issues)} issues, and {len(commits)} commits.\n\n")
+
+                            if repos:
+                                f.write("Repositories containing sensitive data:\n")
+                                for repo in repos[:5]:
+                                    f.write(f"- {repo['repository']}/{repo['file_path']}\n")
+                                f.write("\n")
+
+                            f.write("Exposed secrets in public repositories represent critical security vulnerabilities, potentially providing ")
+                            f.write("direct access to infrastructure, databases, and third-party services.\n\n")
+                        else:
+                            f.write("No secrets were discovered in public GitHub repositories associated with the organization.\n\n")
+
+                        # ASN Enumeration
+                        f.write("### Network Infrastructure (ASN Enumeration)\n\n")
+                        asn_data = self.results.get('asn_data', {})
+
+                        asns = asn_data.get('asn_numbers', [])
+                        ip_ranges = asn_data.get('ip_ranges', [])
+
+                        if asns:
+                            f.write(f"ASN enumeration identified {len(asns)} autonomous system(s) associated with the organization:\n\n")
+                            for asn in asns:
+                                f.write(f"- AS{asn['asn']} - {asn['owner']}\n")
+                            f.write("\n")
+
+                        if ip_ranges:
+                            in_scope = [r for r in ip_ranges if r.get('in_scope') or r.get('contains_discovered_ips')]
+                            out_scope = [r for r in ip_ranges if not r.get('in_scope') and not r.get('contains_discovered_ips')]
+
+                            f.write(f"Total IP ranges discovered: {len(ip_ranges)}\n")
+                            f.write(f"- Ranges within authorized scope: {len(in_scope)}\n")
+                            f.write(f"- Ranges outside authorized scope: {len(out_scope)}\n\n")
+
+                            if out_scope:
+                                f.write("Additional IP ranges were identified that belong to the organization but fall outside the authorized testing scope. ")
+                                f.write("These ranges were documented but not tested.\n\n")
+
+                        # Cloud Storage Enumeration Section
+                        f.write("### Cloud Storage Enumeration\n\n")
+
+                        s3 = self.results.get('s3_buckets', {})
+                        azure = self.results.get('azure_storage', {})
+                        gcp = self.results.get('gcp_storage', {})
+
+                        found_s3 = s3.get('found', [])
+                        found_azure = azure.get('found', [])
+                        found_gcp = gcp.get('found', [])
+
+                        total_cloud = len(found_s3) + len(found_azure) + len(found_gcp)
+
+                        if total_cloud > 0:
+                            public_s3 = [b for b in found_s3 if b['status'] == 'Public Read']
+                            public_azure = [s for s in found_azure if s['status'] == 'Public Read']
+                            public_gcp = [b for b in found_gcp if b['status'] == 'Public Read']
+                            total_public = len(public_s3) + len(public_azure) + len(public_gcp)
+
+                            f.write(f"Cloud storage enumeration discovered {total_cloud} storage resource(s):\n")
+                            f.write(f"- AWS S3: {len(found_s3)} ({len(public_s3)} public)\n")
+                            f.write(f"- Azure Storage: {len(found_azure)} ({len(public_azure)} public)\n")
+                            f.write(f"- GCP Storage: {len(found_gcp)} ({len(public_gcp)} public)\n\n")
+
+                            if total_public > 0:
+                                f.write(f"**{total_public} publicly accessible cloud storage resource(s) identified.**\n\n")
+                                f.write("Public cloud storage represents a critical data exposure risk. Unauthenticated access allows ")
+                                f.write("any internet user to view, and potentially download, sensitive organizational data.\n\n")
+                            else:
+                                f.write("While cloud storage resources were discovered, all were properly configured with private access controls.\n\n")
+                        else:
+                            f.write("No cloud storage resources were discovered during enumeration.\n\n")
+
+                        # Network Enumeration Section
+                        f.write("## Enumeration and Mapping\n\n")
+                        scan = self.results.get('network_scan', {})
+
+                        if scan:
+                            total_hosts = len(scan)
+                            total_ports = sum(len(ports) for ports in scan.values())
+
+                            f.write(f"Network scanning revealed {total_hosts} live hosts with {total_ports} open ports.\n\n")
+
+                            interesting_services = []
+                            for host, ports in scan.items():
+                                for port_num, port_info in ports.items():
+                                    service = port_info.get('service', 'unknown')
+                                    if any(keyword in service.lower() for keyword in ['vpn', 'ssh', 'rdp', 'http', 'ftp', 'smtp']):
+                                        interesting_services.append(f"{host}:{port_num} ({service})")
+
+                            if interesting_services:
+                                f.write("Most promising targets for further investigation:\n")
+                                for service in interesting_services[:10]:
+                                    f.write(f"- {service}\n")
+                                f.write("\n")
 
     def run_all(self):
-            """Run all reconnaissance modules with state tracking"""
-            self.print_banner()
+                """Run all reconnaissance modules with state tracking"""
+                self.print_banner()
 
-            # Prompt for API keys at startup (only if not resuming with keys already set)
-            if not self.state['session'].get('api_keys_prompted'):
-                self.prompt_for_api_keys()
-                self.state['session']['api_keys_prompted'] = True
-                self.save_state()
+                # Prompt for API keys at startup (only if not resuming with keys already set)
+                if not self.state['session'].get('api_keys_prompted'):
+                    self.prompt_for_api_keys()
+                    self.state['session']['api_keys_prompted'] = True
+                    self.save_state()
 
-            try:
-                # Phase 1: Basic reconnaissance
-                if self.should_run_module('scope_validation'):
-                    self.mark_module_status('scope_validation', 'in_progress')
-                    try:
-                        self.scope_validation()
-                        self.mark_module_status('scope_validation', 'complete')
-                    except Exception as e:
-                        self.mark_module_status('scope_validation', 'failed', str(e))
-                        self.print_error(f"scope_validation failed: {e}")
-
-                if self.should_run_module('dns_enumeration'):
-                    self.mark_module_status('dns_enumeration', 'in_progress')
-                    try:
-                        self.dns_enumeration()
-                        self.mark_module_status('dns_enumeration', 'complete')
-                    except Exception as e:
-                        self.mark_module_status('dns_enumeration', 'failed', str(e))
-                        self.print_error(f"dns_enumeration failed: {e}")
-
-                # Phase 1.5: Post-DNS WHOIS lookup (when no IP ranges provided)
-                if not self.ip_ranges and self.should_run_module('post_dns_whois'):
-                    self.mark_module_status('post_dns_whois', 'in_progress')
-                    try:
-                        self.post_dns_whois_lookup()
-                        self.mark_module_status('post_dns_whois', 'complete')
-                    except Exception as e:
-                        self.mark_module_status('post_dns_whois', 'failed', str(e))
-                        self.print_error(f"post_dns_whois failed: {e}")
-
-                if self.should_run_module('technology_stack'):
-                    self.mark_module_status('technology_stack', 'in_progress')
-                    try:
-                        self.technology_stack_identification()
-                        self.mark_module_status('technology_stack', 'complete')
-                    except Exception as e:
-                        self.mark_module_status('technology_stack', 'failed', str(e))
-                        self.print_error(f"technology_stack failed: {e}")
-
-                # Phase 2: OSINT and intelligence gathering
-                # Email harvesting MUST run before LinkedIn to detect email format
-                if self.should_run_module('email_harvesting'):
-                    self.mark_module_status('email_harvesting', 'in_progress')
-                    try:
-                        self.email_harvesting()
-                        self.mark_module_status('email_harvesting', 'complete')
-                    except Exception as e:
-                        self.mark_module_status('email_harvesting', 'failed', str(e))
-                        self.print_error(f"email_harvesting failed: {e}")
-
-                # LinkedIn enumeration runs after email harvesting
-                if self.should_run_module('linkedin_enumeration'):
-                    if self.config.get('linkedin_cookies'):
-                        self.mark_module_status('linkedin_enumeration', 'in_progress')
+                try:
+                    # Phase 1: Basic reconnaissance
+                    if self.should_run_module('scope_validation'):
+                        self.mark_module_status('scope_validation', 'in_progress')
                         try:
-                            self.linkedin_enumeration()
-                            self.mark_module_status('linkedin_enumeration', 'complete')
+                            self.scope_validation()
+                            self.mark_module_status('scope_validation', 'complete')
                         except Exception as e:
-                            self.mark_module_status('linkedin_enumeration', 'failed', str(e))
-                            self.print_error(f"linkedin_enumeration failed: {e}")
-                    else:
-                        self.print_info("Skipping LinkedIn enumeration (no cookies provided)")
-                        self.mark_module_status('linkedin_enumeration', 'skipped')
+                            self.mark_module_status('scope_validation', 'failed', str(e))
+                            self.print_error(f"scope_validation failed: {e}")
 
-                if self.should_run_module('breach_database_check'):
-                    if not self.args.skip_breach_check:
-                        self.mark_module_status('breach_database_check', 'in_progress')
+                    if self.should_run_module('m365_tenant'):
+                        if not self.args.skip_m365:
+                            self.mark_module_status('m365_tenant', 'in_progress')
+                            try:
+                                self.m365_tenant_attribution()
+                                self.mark_module_status('m365_tenant', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('m365_tenant', 'failed', str(e))
+                                self.print_error(f"m365_tenant failed: {e}")
+                        else:
+                            self.mark_module_status('m365_tenant', 'skipped')
+
+                    if self.should_run_module('adfs'):
+                        if not self.args.skip_adfs:
+                            self.mark_module_status('adfs', 'in_progress')
+                            try:
+                                self.adfs_endpoint_discovery()
+                                self.mark_module_status('adfs', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('adfs', 'failed', str(e))
+                                self.print_error(f"adfs failed: {e}")
+                        else:
+                            self.mark_module_status('adfs', 'skipped')
+
+                    if self.should_run_module('dns_enumeration'):
+                        self.mark_module_status('dns_enumeration', 'in_progress')
                         try:
-                            self.breach_database_check()
-                            self.mark_module_status('breach_database_check', 'complete')
+                            self.dns_enumeration()
+                            self.mark_module_status('dns_enumeration', 'complete')
                         except Exception as e:
-                            self.mark_module_status('breach_database_check', 'failed', str(e))
-                            self.print_error(f"breach_database_check failed: {e}")
-                    else:
-                        self.mark_module_status('breach_database_check', 'skipped')
+                            self.mark_module_status('dns_enumeration', 'failed', str(e))
+                            self.print_error(f"dns_enumeration failed: {e}")
 
-                # Phase 3: Advanced enumeration
-                if self.should_run_module('github_secret_scanning'):
-                    if not self.args.skip_github:
-                        self.mark_module_status('github_secret_scanning', 'in_progress')
+                    # Phase 1.5: Post-DNS WHOIS lookup (when no IP ranges provided)
+                    if not self.ip_ranges and self.should_run_module('post_dns_whois'):
+                        self.mark_module_status('post_dns_whois', 'in_progress')
                         try:
-                            self.github_secret_scanning()
-                            self.mark_module_status('github_secret_scanning', 'complete')
+                            self.post_dns_whois_lookup()
+                            self.mark_module_status('post_dns_whois', 'complete')
                         except Exception as e:
-                            self.mark_module_status('github_secret_scanning', 'failed', str(e))
-                            self.print_error(f"github_secret_scanning failed: {e}")
-                    else:
-                        self.mark_module_status('github_secret_scanning', 'skipped')
+                            self.mark_module_status('post_dns_whois', 'failed', str(e))
+                            self.print_error(f"post_dns_whois failed: {e}")
 
-                if self.should_run_module('asn_enumeration'):
-                    if not self.args.skip_asn:
-                        self.mark_module_status('asn_enumeration', 'in_progress')
+                    if self.should_run_module('technology_stack'):
+                        self.mark_module_status('technology_stack', 'in_progress')
                         try:
-                            self.asn_enumeration()
-                            self.mark_module_status('asn_enumeration', 'complete')
+                            self.technology_stack_identification()
+                            self.mark_module_status('technology_stack', 'complete')
                         except Exception as e:
-                            self.mark_module_status('asn_enumeration', 'failed', str(e))
-                            self.print_error(f"asn_enumeration failed: {e}")
-                    else:
-                        self.mark_module_status('asn_enumeration', 'skipped')
+                            self.mark_module_status('technology_stack', 'failed', str(e))
+                            self.print_error(f"technology_stack failed: {e}")
 
-                if self.should_run_module('subdomain_takeover_detection'):
-                    if not self.args.skip_subdomain_takeover:
-                        self.mark_module_status('subdomain_takeover_detection', 'in_progress')
+                    # Phase 2: OSINT and intelligence gathering
+                    # Email harvesting MUST run before LinkedIn to detect email format
+                    if self.should_run_module('email_harvesting'):
+                        self.mark_module_status('email_harvesting', 'in_progress')
                         try:
-                            self.subdomain_takeover_detection()
-                            self.mark_module_status('subdomain_takeover_detection', 'complete')
+                            self.email_harvesting()
+                            self.mark_module_status('email_harvesting', 'complete')
                         except Exception as e:
-                            self.mark_module_status('subdomain_takeover_detection', 'failed', str(e))
-                            self.print_error(f"subdomain_takeover_detection failed: {e}")
-                    else:
-                        self.mark_module_status('subdomain_takeover_detection', 'skipped')
+                            self.mark_module_status('email_harvesting', 'failed', str(e))
+                            self.print_error(f"email_harvesting failed: {e}")
 
-                # Phase 4: Cloud storage enumeration
-                if self.should_run_module('s3_bucket_enumeration'):
-                    if not self.args.skip_s3:
-                        self.mark_module_status('s3_bucket_enumeration', 'in_progress')
-                        try:
-                            self.s3_bucket_enumeration()
-                            self.mark_module_status('s3_bucket_enumeration', 'complete')
-                        except Exception as e:
-                            self.mark_module_status('s3_bucket_enumeration', 'failed', str(e))
-                            self.print_error(f"s3_bucket_enumeration failed: {e}")
-                    else:
-                        self.mark_module_status('s3_bucket_enumeration', 'skipped')
+                    # LinkedIn enumeration runs after email harvesting
+                    if self.should_run_module('linkedin_enumeration'):
+                        if self.config.get('linkedin_cookies'):
+                            self.mark_module_status('linkedin_enumeration', 'in_progress')
+                            try:
+                                self.linkedin_enumeration()
+                                self.mark_module_status('linkedin_enumeration', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('linkedin_enumeration', 'failed', str(e))
+                                self.print_error(f"linkedin_enumeration failed: {e}")
+                        else:
+                            self.print_info("Skipping LinkedIn enumeration (no cookies provided)")
+                            self.mark_module_status('linkedin_enumeration', 'skipped')
 
-                if self.should_run_module('azure_storage_enumeration'):
-                    if not self.args.skip_azure:
-                        self.mark_module_status('azure_storage_enumeration', 'in_progress')
-                        try:
-                            self.azure_storage_enumeration()
-                            self.mark_module_status('azure_storage_enumeration', 'complete')
-                        except Exception as e:
-                            self.mark_module_status('azure_storage_enumeration', 'failed', str(e))
-                            self.print_error(f"azure_storage_enumeration failed: {e}")
-                    else:
-                        self.mark_module_status('azure_storage_enumeration', 'skipped')
+                    if self.should_run_module('breach_database_check'):
+                        if not self.args.skip_breach_check:
+                            self.mark_module_status('breach_database_check', 'in_progress')
+                            try:
+                                self.breach_database_check()
+                                self.mark_module_status('breach_database_check', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('breach_database_check', 'failed', str(e))
+                                self.print_error(f"breach_database_check failed: {e}")
+                        else:
+                            self.mark_module_status('breach_database_check', 'skipped')
 
-                if self.should_run_module('gcp_storage_enumeration'):
-                    if not self.args.skip_gcp:
-                        self.mark_module_status('gcp_storage_enumeration', 'in_progress')
-                        try:
-                            self.gcp_storage_enumeration()
-                            self.mark_module_status('gcp_storage_enumeration', 'complete')
-                        except Exception as e:
-                            self.mark_module_status('gcp_storage_enumeration', 'failed', str(e))
-                            self.print_error(f"gcp_storage_enumeration failed: {e}")
-                    else:
-                        self.mark_module_status('gcp_storage_enumeration', 'skipped')
+                    # Phase 3: Advanced enumeration
+                    if self.should_run_module('github_secret_scanning'):
+                        if not self.args.skip_github:
+                            self.mark_module_status('github_secret_scanning', 'in_progress')
+                            try:
+                                self.github_secret_scanning()
+                                self.mark_module_status('github_secret_scanning', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('github_secret_scanning', 'failed', str(e))
+                                self.print_error(f"github_secret_scanning failed: {e}")
+                        else:
+                            self.mark_module_status('github_secret_scanning', 'skipped')
 
-                # Phase 5: Network enumeration (if IP ranges provided)
-                if self.should_run_module('network_enumeration'):
-                    if self.ip_ranges and not self.args.skip_scan:
-                        self.mark_module_status('network_enumeration', 'in_progress')
-                        try:
-                            self.network_enumeration()
-                            self.mark_module_status('network_enumeration', 'complete')
-                        except Exception as e:
-                            self.mark_module_status('network_enumeration', 'failed', str(e))
-                            self.print_error(f"network_enumeration failed: {e}")
-                    else:
-                        self.mark_module_status('network_enumeration', 'skipped')
+                    if self.should_run_module('asn_enumeration'):
+                        if not self.args.skip_asn:
+                            self.mark_module_status('asn_enumeration', 'in_progress')
+                            try:
+                                self.asn_enumeration()
+                                self.mark_module_status('asn_enumeration', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('asn_enumeration', 'failed', str(e))
+                                self.print_error(f"asn_enumeration failed: {e}")
+                        else:
+                            self.mark_module_status('asn_enumeration', 'skipped')
 
-                # Phase 6: Generate reports
-                self.generate_report()
+                    if self.should_run_module('subdomain_takeover_detection'):
+                        if not self.args.skip_subdomain_takeover:
+                            self.mark_module_status('subdomain_takeover_detection', 'in_progress')
+                            try:
+                                self.subdomain_takeover_detection()
+                                self.mark_module_status('subdomain_takeover_detection', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('subdomain_takeover_detection', 'failed', str(e))
+                                self.print_error(f"subdomain_takeover_detection failed: {e}")
+                        else:
+                            self.mark_module_status('subdomain_takeover_detection', 'skipped')
 
-                # Mark session as complete
-                self.state['session']['completed'] = True
-                self.state['session']['completed_at'] = datetime.now().isoformat()
-                self.save_state()
+                    # Phase 4: Cloud storage enumeration
+                    if self.should_run_module('s3_bucket_enumeration'):
+                        if not self.args.skip_s3:
+                            self.mark_module_status('s3_bucket_enumeration', 'in_progress')
+                            try:
+                                self.s3_bucket_enumeration()
+                                self.mark_module_status('s3_bucket_enumeration', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('s3_bucket_enumeration', 'failed', str(e))
+                                self.print_error(f"s3_bucket_enumeration failed: {e}")
+                        else:
+                            self.mark_module_status('s3_bucket_enumeration', 'skipped')
 
-                self.print_section("RECONNAISSANCE COMPLETE")
-                self.print_success(f"All results saved to: {self.output_dir}")
+                    if self.should_run_module('azure_storage_enumeration'):
+                        if not self.args.skip_azure:
+                            self.mark_module_status('azure_storage_enumeration', 'in_progress')
+                            try:
+                                self.azure_storage_enumeration()
+                                self.mark_module_status('azure_storage_enumeration', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('azure_storage_enumeration', 'failed', str(e))
+                                self.print_error(f"azure_storage_enumeration failed: {e}")
+                        else:
+                            self.mark_module_status('azure_storage_enumeration', 'skipped')
 
-                # Show summary of module statuses
-                self._print_final_summary()
+                    if self.should_run_module('gcp_storage_enumeration'):
+                        if not self.args.skip_gcp:
+                            self.mark_module_status('gcp_storage_enumeration', 'in_progress')
+                            try:
+                                self.gcp_storage_enumeration()
+                                self.mark_module_status('gcp_storage_enumeration', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('gcp_storage_enumeration', 'failed', str(e))
+                                self.print_error(f"gcp_storage_enumeration failed: {e}")
+                        else:
+                            self.mark_module_status('gcp_storage_enumeration', 'skipped')
 
-            except KeyboardInterrupt:
-                # Signal handler will take care of saving state
-                pass
-            except Exception as e:
-                self.print_error(f"Error during reconnaissance: {e}")
-                import traceback
-                traceback.print_exc()
-                self.save_state()
+                    # Phase 5: Network enumeration (if IP ranges provided)
+                    if self.should_run_module('network_enumeration'):
+                        if self.ip_ranges and not self.args.skip_scan:
+                            self.mark_module_status('network_enumeration', 'in_progress')
+                            try:
+                                self.network_enumeration()
+                                self.mark_module_status('network_enumeration', 'complete')
+                            except Exception as e:
+                                self.mark_module_status('network_enumeration', 'failed', str(e))
+                                self.print_error(f"network_enumeration failed: {e}")
+                        else:
+                            self.mark_module_status('network_enumeration', 'skipped')
+
+                    # Phase 6: Generate reports
+                    self.generate_report()
+
+                    # Mark session as complete
+                    self.state['session']['completed'] = True
+                    self.state['session']['completed_at'] = datetime.now().isoformat()
+                    self.save_state()
+
+                    self.print_section("RECONNAISSANCE COMPLETE")
+                    self.print_success(f"All results saved to: {self.output_dir}")
+
+                    # Show summary of module statuses
+                    self._print_final_summary()
+
+                except KeyboardInterrupt:
+                    # Signal handler will take care of saving state
+                    pass
+                except Exception as e:
+                    self.print_error(f"Error during reconnaissance: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.save_state()
 
     def _print_final_summary(self):
         """Print summary of all module statuses"""
@@ -5754,41 +6609,43 @@ class ReconAutomation:
     # =========================================================================
 
     def init_state(self):
-            """Initialize state tracking structure"""
-            self.state = {
-                'version': '1.0',
-                'target': {
-                    'domain': self.domain,
-                    'client': self.client_name,
-                    'ip_ranges': self.ip_ranges,
-                    'config_hash': self._generate_config_hash()
-                },
-                'session': {
-                    'started_at': datetime.now().isoformat(),
-                    'last_updated': datetime.now().isoformat(),
-                    'interrupted': False,
-                    'completed': False
-                },
-                'modules': {
-                    'scope_validation': {'status': 'pending', 'progress': {}},
-                    'dns_enumeration': {'status': 'pending', 'progress': {}},
-                    'post_dns_whois': {'status': 'pending', 'progress': {}},
-                    'technology_stack': {'status': 'pending', 'progress': {}},
-                    'email_harvesting': {'status': 'pending', 'progress': {}},
-                    'linkedin_enumeration': {'status': 'pending', 'progress': {}},
-                    'breach_database_check': {'status': 'pending', 'progress': {}},
-                    'github_secret_scanning': {'status': 'pending', 'progress': {}},
-                    'asn_enumeration': {'status': 'pending', 'progress': {}},
-                    'subdomain_takeover_detection': {'status': 'pending', 'progress': {}},
-                    's3_bucket_enumeration': {'status': 'pending', 'progress': {}},
-                    'azure_storage_enumeration': {'status': 'pending', 'progress': {}},
-                    'gcp_storage_enumeration': {'status': 'pending', 'progress': {}},
-                    'network_enumeration': {'status': 'pending', 'progress': {}},
-                },
-                'results': {}
-            }
-            self.state_file = self.output_dir / 'recon_state.json'
-            self._shutdown_in_progress = False
+                """Initialize state tracking structure"""
+                self.state = {
+                    'version': '1.0',
+                    'target': {
+                        'domain': self.domain,
+                        'client': self.client_name,
+                        'ip_ranges': self.ip_ranges,
+                        'config_hash': self._generate_config_hash()
+                    },
+                    'session': {
+                        'started_at': datetime.now().isoformat(),
+                        'last_updated': datetime.now().isoformat(),
+                        'interrupted': False,
+                        'completed': False
+                    },
+                    'modules': {
+                        'scope_validation': {'status': 'pending', 'progress': {}},
+                        'm365_tenant': {'status': 'pending', 'progress': {}},
+                        'adfs': {'status': 'pending', 'progress': {}},
+                        'dns_enumeration': {'status': 'pending', 'progress': {}},
+                        'post_dns_whois': {'status': 'pending', 'progress': {}},
+                        'technology_stack': {'status': 'pending', 'progress': {}},
+                        'email_harvesting': {'status': 'pending', 'progress': {}},
+                        'linkedin_enumeration': {'status': 'pending', 'progress': {}},
+                        'breach_database_check': {'status': 'pending', 'progress': {}},
+                        'github_secret_scanning': {'status': 'pending', 'progress': {}},
+                        'asn_enumeration': {'status': 'pending', 'progress': {}},
+                        'subdomain_takeover_detection': {'status': 'pending', 'progress': {}},
+                        's3_bucket_enumeration': {'status': 'pending', 'progress': {}},
+                        'azure_storage_enumeration': {'status': 'pending', 'progress': {}},
+                        'gcp_storage_enumeration': {'status': 'pending', 'progress': {}},
+                        'network_enumeration': {'status': 'pending', 'progress': {}},
+                    },
+                    'results': {}
+                }
+                self.state_file = self.output_dir / 'recon_state.json'
+                self._shutdown_in_progress = False
 
     def _generate_config_hash(self) -> str:
         """Generate hash of target configuration for change detection"""
@@ -6095,6 +6952,8 @@ Examples:
     python3 quick_recon.py -d example.com -c "Acme Corp" --s3-only
     python3 quick_recon.py -d example.com -c "Acme Corp" --dns-only
     python3 quick_recon.py -d example.com -c "Acme Corp" --email-only
+    python3 quick_recon.py -d example.com -c "Acme Corp" --m365-only
+    python3 quick_recon.py -d example.com -c "Acme Corp" --adfs-only
 
   Skip all OSINT modules:
     python3 quick_recon.py -d example.com -i 192.168.1.0/24 -c "Acme Corp" --skip-osint
@@ -6119,6 +6978,8 @@ Examples:
     parser.add_argument('--skip-github', action='store_true', help='Skip GitHub secret scanning')
     parser.add_argument('--skip-asn', action='store_true', help='Skip ASN enumeration')
     parser.add_argument('--skip-subdomain-takeover', action='store_true', help='Skip subdomain takeover detection')
+    parser.add_argument('--skip-m365', action='store_true', help='Skip M365/Azure AD tenant attribution')
+    parser.add_argument('--skip-adfs', action='store_true', help='Skip ADFS endpoint discovery')
     parser.add_argument('--skip-osint', action='store_true', help='Skip all OSINT modules (GitHub, LinkedIn)')
     parser.add_argument('--linkedin-max-results', type=int, default=100, help='Maximum LinkedIn employee results to fetch (default: 100)')
 
@@ -6134,6 +6995,8 @@ Examples:
     parser.add_argument('--dns-only', action='store_true', help='Run only DNS enumeration')
     parser.add_argument('--breach-only', action='store_true', help='Run only breach database check')
     parser.add_argument('--techstack-only', action='store_true', help='Run only technology stack identification')
+    parser.add_argument('--m365-only', action='store_true', help='Run only M365 tenant attribution')
+    parser.add_argument('--adfs-only', action='store_true', help='Run only ADFS endpoint discovery (runs M365 first)')
 
     args = parser.parse_args()
 
@@ -6161,6 +7024,8 @@ Examples:
         'dns_only': ('DNS enumeration', 'dns_enumeration', 'dns_enumeration'),
         'breach_only': ('Breach database check', 'breach_database_check', 'breach_data'),
         'techstack_only': ('Technology stack identification', 'technology_stack_identification', 'technology_stack'),
+        'm365_only': ('M365 tenant attribution', 'm365_tenant_attribution', 'm365_tenant'),
+        'adfs_only': ('ADFS endpoint discovery', 'adfs_endpoint_discovery', 'adfs'),
     }
 
     active_only_mode = None
@@ -6210,6 +7075,11 @@ Examples:
         if mode_name == 'breach_only':
             print(f"{Colors.OKCYAN}[i] Running email harvesting first (required for breach check){Colors.ENDC}")
             recon.email_harvesting()
+
+        # ADFS discovery needs M365 attribution first
+        if mode_name == 'adfs_only':
+            print(f"{Colors.OKCYAN}[i] Running M365 tenant attribution first (required for ADFS discovery){Colors.ENDC}")
+            recon.m365_tenant_attribution()
 
         try:
             method = getattr(recon, method_name)
@@ -6297,7 +7167,6 @@ Examples:
 
     # Run all reconnaissance
     recon.run_all()
-
 
 if __name__ == '__main__':
     main()
