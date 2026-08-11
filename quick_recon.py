@@ -14,11 +14,12 @@
 #          You are free to use, modify, and distribute this software
 #          in accordance with the terms of the license.
 #
-# Purpose: This script provides an automated installation and management system
-#          for a vulnerability assessment and penetration testing
-#          toolkit. It installs and configures security tools across multiple
-#          categories including exploitation, web testing, network scanning,
-#          mobile security, cloud security, and Active Directory testing.
+# Purpose: Standalone offensive reconnaissance and OSINT console for authorized
+#          engagements. Performs external attack-surface enumeration including
+#          DNS, email harvesting, breach lookups, GitHub secret scanning, cloud
+#          storage discovery, ASN attribution, M365/Azure AD tenant attribution
+#          and enrichment, ADFS discovery, and authenticated LinkedIn company
+#          and employee enumeration, with checkpoint/resume and rate-aware pacing.
 #
 # DISCLAIMER: This software is provided "as-is," without warranty of any kind,
 #             express or implied, including but not limited to the warranties
@@ -34,6 +35,60 @@
 #         state, federal, and international laws.
 #
 # =============================================================================
+
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+
+def _ensure_venv():
+    """Ensure a dedicated venv exists with dependencies, relaunching into it when needed."""
+    if os.environ.get('QUICK_RECON_VENV_ACTIVE') == '1':
+        return
+
+    script_path = Path(__file__).resolve()
+    venv_dir = script_path.parent / '.venv-quick_recon'
+    if os.name == 'nt':
+        venv_python = venv_dir / 'Scripts' / 'python.exe'
+    else:
+        venv_python = venv_dir / 'bin' / 'python'
+
+    requirements = ['requests>=2.31.0', 'urllib3>=1.26.0', 'dnspython>=2.6.1']
+    import_check = 'import requests, urllib3, dns.resolver'
+
+    # Create the venv on first run
+    if not venv_python.exists():
+        print(f"[i] Creating virtual environment at {venv_dir}")
+        try:
+            import venv as _venv
+            _venv.EnvBuilder(with_pip=True).create(str(venv_dir))
+        except Exception as e:
+            sys.stderr.write(f"[-] Failed to create venv: {e}\n")
+            sys.stderr.write("[-] On Debian or Ubuntu install the venv module with sudo apt install python3-venv\n")
+            sys.exit(1)
+
+    # Install dependencies only when the import check fails
+    check = subprocess.run([str(venv_python), '-c', import_check],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if check.returncode != 0:
+        print("[i] Installing dependencies into venv (first run or missing packages)")
+        try:
+            subprocess.run([str(venv_python), '-m', 'pip', 'install', '--upgrade', 'pip'], check=True)
+            subprocess.run([str(venv_python), '-m', 'pip', 'install', *requirements], check=True)
+        except subprocess.CalledProcessError as e:
+            sys.stderr.write(f"[-] Dependency installation failed: {e}\n")
+            sys.exit(1)
+
+    # Relaunch under the venv interpreter unless we are already running it
+    if Path(sys.executable).resolve() != venv_python.resolve():
+        os.environ['QUICK_RECON_VENV_ACTIVE'] = '1'
+        os.execv(str(venv_python), [str(venv_python), str(script_path), *sys.argv[1:]])
+
+
+if __name__ == '__main__':
+    _ensure_venv()
+
 
 import argparse
 import json
@@ -91,6 +146,47 @@ class ReconAutomation:
 
     # Max unknown-type files to pull per bucket when download_unknown_files is enabled
     UNKNOWN_DOWNLOAD_CAP = 10
+
+    # Default public DNS resolvers for authoritative record lookups (SPF/DKIM/DMARC)
+    DEFAULT_DNS_RESOLVERS = ['1.1.1.1', '8.8.8.8', '9.9.9.9']
+
+    # Hosting, CDN, and shared-infrastructure ASN owners (lowercase substrings). An ASN
+    # whose owner matches any of these is attributed to the provider, not the client, and
+    # its prefixes are never recorded as org ranges. Prevents shared provider space from
+    # being reported as client infrastructure.
+    HOSTING_ASN_OWNERS = {
+        'amazon', 'aws', 'microsoft', 'azure', 'msn', 'google', 'cloudflare', 'akamai',
+        'fastly', 'digitalocean', 'digital ocean', 'linode', 'ovh', 'hetzner', 'godaddy',
+        'vultr', 'choopa', 'oracle', 'softlayer', 'ibm', 'rackspace', 'leaseweb', 'contabo',
+        'scaleway', 'online s.a.s', 'alibaba', 'aliyun', 'tencent', 'cloudfront', 'incapsula',
+        'imperva', 'sucuri', 'stackpath', 'edgecast', 'verizon digital', 'limelight',
+        'cdn77', 'bunny', 'gcore', 'g-core', 'netlify', 'vercel', 'heroku', 'squarespace',
+        'wix', 'shopify', 'wpengine', 'automattic', 'namecheap', 'hostinger', 'unified layer',
+        'bluehost', 'dreamhost', 'hostgator', 'ionos', '1&1', 'gandi', 'digitalocean, llc',
+        'ovh sas', 'ovh us', 'ovh hosting'
+    }
+
+    # Well-known hosting/CDN ASN numbers as a strings set, used alongside owner matching.
+    HOSTING_ASN_NUMBERS = {
+        '16509', '14618',
+        '8075', '8068', '8069',
+        '15169', '396982', '19527',
+        '13335',
+        '20940', '16625', '12222', '35994', '35993',
+        '54113',
+        '14061',
+        '16276',
+        '24940',
+        '20473',
+        '63949',
+        '26496', '398101',
+        '132203',
+        '45102', '37963',
+        '19551',
+        '54994',
+        '2635',
+        '13238'
+    }
 
     def __init__(self, domain, ip_ranges: List[str], output_dir: str, client_name: str, auto_resume: bool = False):
                 # domain may be a single string or a list of domains
@@ -151,6 +247,7 @@ class ReconAutomation:
                     'client': self.client_name,
                     'scope_validation': {},
                     'm365_tenant': {},
+                    'm365_enrichment': {},
                     'adfs': {},
                     'email_security': {},
                     'dns_enumeration': {},
@@ -164,7 +261,8 @@ class ReconAutomation:
                     'github_secrets': {},
                     'linkedin_intel': {},
                     'asn_data': {},
-                    'subdomain_takeovers': []
+                    'subdomain_takeovers': [],
+                    'ct_scope_correlation': {}
                 }
 
     def _handle_existing_state(self):
@@ -952,6 +1050,381 @@ class ReconAutomation:
                 if adfs_data['federation_metadata'].get('entity_id'):
                     self.print_info(f"  Entity ID: {adfs_data['federation_metadata']['entity_id']}")
 
+    def m365_enrichment(self):
+                """Passive M365/Azure AD enrichment. Runs after tenant attribution and is
+                gated on is_m365. Four account-agnostic capabilities, no username validation:
+                  1. Verified-domain enumeration via GetFederationInformation SOAP.
+                  2. Tenant configuration disclosure via a synthetic GetCredentialType probe.
+                  3. Legacy-auth surface reachability against shared Exchange Online endpoints.
+                  4. Hybrid on-premises signal from MX, autodiscover, device-reg, and SPF records.
+                No enumerated domain is tested and no real account is asserted or submitted."""
+                self.print_section("M365/AZURE AD ENRICHMENT")
+
+                resume_data = self.get_resume_data('m365_enrichment')
+                progress = resume_data.get('progress', {})
+
+                enrich = progress.get('enrich_data', {
+                    'ran': False,
+                    'verified_domains': {
+                        'all': [],
+                        'in_scope': [],
+                        'out_of_scope': [],
+                        'tenant_default_domain': '',
+                        'count': 0
+                    },
+                    'tenant_config': {
+                        'desktop_sso_enabled': False,
+                        'throttle_status': None,
+                        'branding_present': False,
+                        'boilerplate_text': '',
+                        'domain_type': None
+                    },
+                    'legacy_auth_surface': {
+                        'basic_auth_offered': False,
+                        'endpoints': {},
+                        'legacy_token_endpoint_present': False
+                    },
+                    'hybrid_signal': {
+                        'seamless_sso': False,
+                        'mx_hosts': [],
+                        'mx_routing': '',
+                        'autodiscover_cname': '',
+                        'autodiscover_routing': '',
+                        'device_registration': False,
+                        'spf_onprem_mechanisms': [],
+                        'assessment': ''
+                    }
+                })
+
+                # Skip if already complete from checkpoint
+                if progress.get('complete'):
+                    self.print_info("Restored M365 enrichment data from checkpoint")
+                    self.results['m365_enrichment'] = enrich
+                    return
+
+                # Gate: only run for confirmed M365 tenants
+                m365 = self.results.get('m365_tenant', {})
+                if not m365.get('is_m365'):
+                    self.print_info("Skipping M365 enrichment (not an M365 tenant)")
+                    self.results['m365_enrichment'] = enrich
+                    self.checkpoint('m365_enrichment', 'complete', True)
+                    return
+
+                tenant_id = m365.get('tenant_id', '')
+                authorized = {d.lower() for d in self.domains}
+
+                # Resolver for hybrid-signal DNS lookups. Same fixed public-resolver
+                # vantage as the email-security module so records are read authoritatively.
+                resolver = dns.resolver.Resolver()
+                resolver.timeout = 5
+                resolver.lifetime = 10
+                configured = getattr(self.args, 'resolvers', None) if hasattr(self, 'args') else None
+                resolver_ips = []
+                if configured:
+                    for entry in configured.split(','):
+                        entry = entry.strip()
+                        if not entry:
+                            continue
+                        try:
+                            ipaddress.ip_address(entry)
+                            resolver_ips.append(entry)
+                        except ValueError:
+                            pass
+                if not resolver_ips:
+                    resolver_ips = list(self.DEFAULT_DNS_RESOLVERS)
+                resolver.nameservers = resolver_ips
+
+                # =====================================================================
+                # 1. Verified-domain enumeration via GetFederationInformation SOAP
+                #    Pure metadata against a Microsoft endpoint. Returns every domain
+                #    verified or federated on the tenant. Cataloged and classified against
+                #    the authorized domain list. Out-of-scope domains are flagged only,
+                #    never probed. This is the highest-value passive follow-on.
+                # =====================================================================
+                self.print_info("Enumerating verified tenant domains (GetFederationInformation)...")
+
+                soap_body = (
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<soap:Envelope xmlns:exm="http://schemas.microsoft.com/exchange/services/2006/messages" '
+                    'xmlns:ext="http://schemas.microsoft.com/exchange/services/2006/types" '
+                    'xmlns:a="http://www.w3.org/2005/08/addressing" '
+                    'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<soap:Header>'
+                    '<a:Action soap:mustUnderstand="1">http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetFederationInformation</a:Action>'
+                    '<a:To soap:mustUnderstand="1">https://autodiscover-s.outlook.com/autodiscover/autodiscover.svc</a:To>'
+                    '<a:ReplyTo><a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address></a:ReplyTo>'
+                    '</soap:Header>'
+                    '<soap:Body>'
+                    '<GetFederationInformationRequestMessage xmlns="http://schemas.microsoft.com/exchange/2010/Autodiscover">'
+                    f'<Request><Domain>{self.domain}</Domain></Request>'
+                    '</GetFederationInformationRequestMessage>'
+                    '</soap:Body>'
+                    '</soap:Envelope>'
+                )
+
+                try:
+                    response = requests.post(
+                        'https://autodiscover-s.outlook.com/autodiscover/autodiscover.svc',
+                        data=soap_body,
+                        headers={
+                            'Content-Type': 'text/xml; charset=utf-8',
+                            'SOAPAction': '"http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetFederationInformation"',
+                            'User-Agent': 'AutodiscoverClient'
+                        },
+                        timeout=20,
+                        verify=False
+                    )
+
+                    if response.status_code == 200:
+                        raw_domains = re.findall(r'<Domain>([^<]+)</Domain>', response.text)
+                        seen = set()
+                        all_domains = []
+                        for d in raw_domains:
+                            dl = d.strip().lower()
+                            if not dl or dl in seen:
+                                continue
+                            seen.add(dl)
+                            all_domains.append(dl)
+
+                        in_scope = [d for d in all_domains if d in authorized]
+                        out_of_scope = [d for d in all_domains if d not in authorized]
+                        default_domain = next((d for d in all_domains if d.endswith('.onmicrosoft.com') and not d.endswith('.mail.onmicrosoft.com')), '')
+
+                        enrich['verified_domains']['all'] = all_domains
+                        enrich['verified_domains']['in_scope'] = in_scope
+                        enrich['verified_domains']['out_of_scope'] = out_of_scope
+                        enrich['verified_domains']['tenant_default_domain'] = default_domain
+                        enrich['verified_domains']['count'] = len(all_domains)
+
+                        self.print_success(f"Verified domains on tenant: {len(all_domains)}")
+                        if default_domain:
+                            self.print_info(f"  Tenant default domain: {default_domain}")
+                        self.print_info(f"  In authorized scope: {len(in_scope)}")
+                        if out_of_scope:
+                            self.print_warning(f"  Out of authorized scope: {len(out_of_scope)} (flagged, not tested)")
+                    else:
+                        self.print_warning(f"GetFederationInformation returned status {response.status_code}")
+
+                except Exception as e:
+                    self.print_error(f"GetFederationInformation query failed: {e}")
+
+                self.checkpoint('m365_enrichment', 'enrich_data', enrich)
+
+                # =====================================================================
+                # 2. Tenant configuration disclosure via GetCredentialType
+                #    A single POST with a synthetic non-existent username reads tenant-wide
+                #    realm properties without validating any real account: Seamless SSO
+                #    (DesktopSsoEnabled), throttling posture, branding, and DomainType.
+                #    IfExistsResult is deliberately ignored - that is user-validation surface.
+                # =====================================================================
+                self.print_info("Reading tenant configuration (GetCredentialType synthetic probe)...")
+
+                synthetic = f"zzq{random.randint(10000000, 99999999)}@{self.domain}"
+                try:
+                    response = requests.post(
+                        'https://login.microsoftonline.com/common/GetCredentialType',
+                        json={'Username': synthetic, 'isOtherIdpSupported': True},
+                        headers={
+                            'Content-Type': 'application/json; charset=UTF-8',
+                            'Accept': 'application/json'
+                        },
+                        timeout=15,
+                        verify=False
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        ests = data.get('EstsProperties') or {}
+
+                        desktop_sso = bool(ests.get('DesktopSsoEnabled', False))
+                        enrich['tenant_config']['desktop_sso_enabled'] = desktop_sso
+                        enrich['hybrid_signal']['seamless_sso'] = desktop_sso
+
+                        throttle = data.get('ThrottleStatus')
+                        enrich['tenant_config']['throttle_status'] = throttle
+
+                        domain_type = ests.get('DomainType', data.get('DomainType'))
+                        enrich['tenant_config']['domain_type'] = domain_type
+
+                        branding = ests.get('UserTenantBranding') or []
+                        enrich['tenant_config']['branding_present'] = bool(branding)
+                        if branding and isinstance(branding, list):
+                            boiler = (branding[0] or {}).get('BoilerPlateText', '') or ''
+                            boiler = boiler.strip()
+                            if boiler:
+                                enrich['tenant_config']['boilerplate_text'] = boiler[:500]
+
+                        if desktop_sso:
+                            self.print_warning("  Seamless SSO enabled (Azure AD Connect on-premises indicator)")
+                        else:
+                            self.print_info("  Seamless SSO not advertised")
+                        if throttle not in (None, 0):
+                            self.print_warning(f"  Throttling active (ThrottleStatus={throttle}) - relevant to later spray pacing")
+                        if enrich['tenant_config']['boilerplate_text']:
+                            self.print_success("  Custom sign-in boilerplate text present (pretext value)")
+                    else:
+                        self.print_warning(f"GetCredentialType returned status {response.status_code}")
+
+                except Exception as e:
+                    self.print_error(f"GetCredentialType probe failed: {e}")
+
+                self.checkpoint('m365_enrichment', 'enrich_data', enrich)
+
+                # =====================================================================
+                # 3. Legacy-auth surface reachability (account-agnostic)
+                #    Unauthenticated probes of shared Exchange Online endpoints record which
+                #    WWW-Authenticate schemes are offered at the service layer. Basic being
+                #    offered means legacy auth is not blocked service-side. Per-tenant CA
+                #    enforcement still gates actual use and requires an authenticated probe
+                #    to confirm, so this is a go / no-go gate for a later legacy-auth phase,
+                #    not proof of policy. No username is submitted.
+                # =====================================================================
+                self.print_info("Probing legacy-auth surface (account-agnostic reachability)...")
+
+                legacy_endpoints = {
+                    'ews': 'https://outlook.office365.com/EWS/Exchange.asmx',
+                    'activesync': 'https://outlook.office365.com/Microsoft-Server-ActiveSync',
+                    'oab': 'https://outlook.office365.com/OAB/'
+                }
+
+                basic_offered = False
+                for name, url in legacy_endpoints.items():
+                    try:
+                        response = requests.get(url, timeout=10, verify=False, allow_redirects=False)
+                        www_auth = response.headers.get('WWW-Authenticate', '')
+                        schemes = []
+                        if www_auth:
+                            schemes = sorted({s.strip().split(' ')[0] for s in www_auth.split(',') if s.strip()})
+                        enrich['legacy_auth_surface']['endpoints'][name] = {
+                            'status': response.status_code,
+                            'schemes': schemes
+                        }
+                        if any(s.lower() == 'basic' for s in schemes):
+                            basic_offered = True
+                    except Exception as e:
+                        enrich['legacy_auth_surface']['endpoints'][name] = {'error': str(e)[:100]}
+                    time.sleep(0.3)
+
+                enrich['legacy_auth_surface']['basic_auth_offered'] = basic_offered
+
+                # Legacy v1 token endpoint presence (tenant-scoped). A GET is rejected with a
+                # 4xx that is not 404 when the endpoint exists, confirming the legacy grant path.
+                if tenant_id:
+                    try:
+                        response = requests.get(
+                            f'https://login.microsoftonline.com/{tenant_id}/oauth2/token',
+                            timeout=10, verify=False, allow_redirects=False
+                        )
+                        present = response.status_code in (400, 401, 405)
+                        enrich['legacy_auth_surface']['legacy_token_endpoint_present'] = present
+                    except Exception:
+                        pass
+
+                if basic_offered:
+                    self.print_warning("  Basic auth offered at service layer (legacy-auth phase viable pending CA confirmation)")
+                else:
+                    self.print_info("  Basic auth not offered at probed endpoints")
+
+                self.checkpoint('m365_enrichment', 'enrich_data', enrich)
+
+                # =====================================================================
+                # 4. Hybrid on-premises signal
+                #    MX routing, autodiscover CNAME target, device-registration CNAME, and
+                #    non-Microsoft SPF mechanisms together indicate whether an on-premises
+                #    identity or mail footprint sits behind the cloud front. Combined with
+                #    Seamless SSO from step 2, this reframes where the crown jewels sit.
+                # =====================================================================
+                self.print_info("Assessing hybrid / on-premises signal...")
+
+                # MX routing
+                try:
+                    answers = resolver.resolve(self.domain, 'MX')
+                    mx_hosts = sorted({str(r.exchange).rstrip('.').lower() for r in answers})
+                    enrich['hybrid_signal']['mx_hosts'] = mx_hosts
+                    if mx_hosts and all(h.endswith('.mail.protection.outlook.com') for h in mx_hosts):
+                        enrich['hybrid_signal']['mx_routing'] = 'cloud'
+                    elif mx_hosts:
+                        enrich['hybrid_signal']['mx_routing'] = 'onprem_or_thirdparty'
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                    pass
+                except Exception:
+                    pass
+
+                # Autodiscover CNAME target
+                try:
+                    answers = resolver.resolve(f'autodiscover.{self.domain}', 'CNAME')
+                    cname = str(answers[0].target).rstrip('.').lower()
+                    enrich['hybrid_signal']['autodiscover_cname'] = cname
+                    if cname == 'autodiscover.outlook.com':
+                        enrich['hybrid_signal']['autodiscover_routing'] = 'cloud'
+                    else:
+                        enrich['hybrid_signal']['autodiscover_routing'] = 'onprem'
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                    enrich['hybrid_signal']['autodiscover_routing'] = 'none'
+                except Exception:
+                    pass
+
+                # Device-registration CNAME (Azure AD hybrid join / device registration)
+                try:
+                    resolver.resolve(f'enterpriseregistration.{self.domain}', 'CNAME')
+                    enrich['hybrid_signal']['device_registration'] = True
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                    pass
+                except Exception:
+                    pass
+
+                # Non-Microsoft SPF mechanisms (hybrid or third-party mail flow)
+                try:
+                    answers = resolver.resolve(self.domain, 'TXT')
+                    for r in answers:
+                        txt = ''.join(s.decode() if isinstance(s, bytes) else str(s) for s in r.strings)
+                        if not txt.lower().startswith('v=spf1'):
+                            continue
+                        mechs = re.findall(r'(?:ip4:|ip6:|include:)[^\s]+', txt, re.IGNORECASE)
+                        onprem = [m for m in mechs if 'spf.protection.outlook.com' not in m.lower()]
+                        if onprem:
+                            enrich['hybrid_signal']['spf_onprem_mechanisms'] = onprem
+                        break
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                    pass
+                except Exception:
+                    pass
+
+                # Verdict
+                hs = enrich['hybrid_signal']
+                indicators = []
+                if hs['seamless_sso']:
+                    indicators.append('Seamless SSO')
+                if hs['device_registration']:
+                    indicators.append('device registration')
+                if hs['autodiscover_routing'] == 'onprem':
+                    indicators.append('on-prem autodiscover')
+                if hs['mx_routing'] == 'onprem_or_thirdparty':
+                    indicators.append('non-cloud MX')
+                if hs['spf_onprem_mechanisms']:
+                    indicators.append('non-Microsoft SPF')
+
+                if indicators:
+                    hs['assessment'] = 'Hybrid indicators present: ' + ', '.join(indicators)
+                    self.print_warning(f"  {hs['assessment']}")
+                else:
+                    hs['assessment'] = 'No hybrid indicators; tenant appears cloud-only'
+                    self.print_info(f"  {hs['assessment']}")
+
+                # Store final results
+                enrich['ran'] = True
+                self.results['m365_enrichment'] = enrich
+                self.checkpoint('m365_enrichment', 'enrich_data', enrich)
+                self.checkpoint('m365_enrichment', 'complete', True)
+
+                # Summary
+                vd = enrich['verified_domains']
+                self.print_info("\nM365 Enrichment Summary:")
+                self.print_info(f"  Verified domains: {vd['count']} ({len(vd['in_scope'])} in scope, {len(vd['out_of_scope'])} out)")
+                self.print_info(f"  Seamless SSO: {'Yes' if enrich['tenant_config']['desktop_sso_enabled'] else 'No'}")
+                self.print_info(f"  Basic auth offered: {'Yes' if enrich['legacy_auth_surface']['basic_auth_offered'] else 'No'}")
+                self.print_info(f"  {hs['assessment']}")
+
     def email_security_posture(self):
                 """Assess SPF, DKIM, and DMARC posture for the target domain"""
                 self.print_section("EMAIL SECURITY POSTURE (SPF/DKIM/DMARC)")
@@ -992,6 +1465,26 @@ class ReconAutomation:
                 resolver = dns.resolver.Resolver()
                 resolver.timeout = 5
                 resolver.lifetime = 10
+
+                # Point SPF/DKIM/DMARC lookups at explicit resolvers. These are public
+                # authoritative records so a fixed resolver vantage does not distort findings.
+                # Defaults to public resolvers, overridable with --resolvers.
+                configured = getattr(self.args, 'resolvers', None) if hasattr(self, 'args') else None
+                resolver_ips = []
+                if configured:
+                    for entry in configured.split(','):
+                        entry = entry.strip()
+                        if not entry:
+                            continue
+                        try:
+                            ipaddress.ip_address(entry)
+                            resolver_ips.append(entry)
+                        except ValueError:
+                            self.print_warning(f"  Ignoring invalid resolver address: {entry}")
+                if not resolver_ips:
+                    resolver_ips = list(self.DEFAULT_DNS_RESOLVERS)
+                resolver.nameservers = resolver_ips
+                self.print_info(f"  Using DNS resolvers: {', '.join(resolver_ips)}")
 
                 # =====================================================================
                 # SPF Analysis
@@ -1514,15 +2007,19 @@ class ReconAutomation:
                     print("    4. In Request Headers, find 'Cookie:' and copy the ENTIRE value")
                     cookies = input("    Enter full LinkedIn cookie string (or press Enter to skip): ").strip()
                     if cookies:
-                        self.config['linkedin_cookies'] = cookies
-                        # Validate the cookies
-                        self.print_info("Validating LinkedIn cookies...")
-                        if self._validate_api_token('linkedin'):
-                            self.print_success("LinkedIn cookies validated and saved")
-                            updated = True
-                        else:
-                            self.print_error("LinkedIn cookies are invalid")
+                        if not self._sanity_check_linkedin_cookies(cookies):
+                            self.print_error("LinkedIn cookies failed sanity check")
                             self.config['linkedin_cookies'] = ''
+                        else:
+                            self.config['linkedin_cookies'] = cookies
+                            # Validate the cookies
+                            self.print_info("Validating LinkedIn cookies...")
+                            if self._validate_api_token('linkedin'):
+                                self.print_success("LinkedIn cookies validated and saved")
+                                updated = True
+                            else:
+                                self.print_error("LinkedIn cookies are invalid")
+                                self.config['linkedin_cookies'] = ''
                     else:
                         self.print_info("Skipping LinkedIn - employee enumeration will be skipped")
                 else:
@@ -1716,6 +2213,10 @@ class ReconAutomation:
             if choice == 'n':
                 new_token = input(f"    Enter new {config['name']}: ").strip()
                 if new_token:
+                    if service == 'linkedin' and not self._sanity_check_linkedin_cookies(new_token):
+                        self.print_error("New LinkedIn cookies failed sanity check")
+                        self.config[config['key']] = ''
+                        return False
                     self.config[config['key']] = new_token
                     if self._validate_api_token(service):
                         self.print_success(f"{config['name']} validated successfully")
@@ -2335,6 +2836,62 @@ class ReconAutomation:
 
                 return findings
 
+    def _sanity_check_linkedin_cookies(self, cookie_string):
+        if not cookie_string or not cookie_string.strip():
+            self.print_error("LinkedIn cookie string is empty")
+            return False
+
+        parsed = {}
+        for cookie in cookie_string.split(';'):
+            cookie = cookie.strip()
+            if '=' in cookie:
+                name, value = cookie.split('=', 1)
+                parsed[name.strip()] = value.strip()
+
+        if not parsed.get('li_at'):
+            self.print_error("Cookie string missing li_at (session token) - cannot authenticate")
+            return False
+
+        if not parsed.get('JSESSIONID'):
+            self.print_error("Cookie string missing JSESSIONID (needed for CSRF token)")
+            return False
+
+        salesnav = 'li_ep_auth_context' in parsed or 'salesnavigator' in cookie_string.lower()
+        if salesnav:
+            self.print_info("Cookie appears pulled from a Sales Navigator session; a plain linkedin.com/feed tab is cleaner but not required")
+
+        return True
+
+    def _prompt_with_timeout(self, prompt, timeout, default):
+        try:
+            is_tty = sys.stdin.isatty()
+        except Exception:
+            is_tty = False
+
+        if not is_tty or not hasattr(signal, 'SIGALRM'):
+            return default
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError()
+
+        prior = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        try:
+            signal.alarm(int(timeout))
+            return input(prompt)
+        except TimeoutError:
+            print()
+            self.print_info(f"No response in {int(timeout)}s - using default")
+            return default
+        except (EOFError, KeyboardInterrupt):
+            return default
+        finally:
+            signal.alarm(0)
+            try:
+                signal.signal(signal.SIGALRM, prior)
+            except Exception:
+                pass
+
     def linkedin_enumeration(self):
                         """LinkedIn intelligence gathering using authenticated session with checkpoint support and human-like delays"""
                         self.print_section("LinkedIn Information Gathering")
@@ -2376,7 +2933,7 @@ class ReconAutomation:
                             }
                         }
                         profile = delay_profiles.get(mode, delay_profiles['normal'])
-                        self.print_info(f"LinkedIn delay mode: {mode} (session cap: {profile['session_cap']} API calls)")
+                        self.print_info(f"LinkedIn delay mode (company phase): {mode} (session cap: {profile['session_cap']} API calls)")
 
                         # Session-level tracking
                         api_call_count = 0
@@ -2399,6 +2956,10 @@ class ReconAutomation:
                                 print("    4. In Request Headers, find 'Cookie:' and copy the ENTIRE value")
                                 cookies = input("\n    Enter full LinkedIn cookie string: ").strip()
                                 if cookies:
+                                    if not self._sanity_check_linkedin_cookies(cookies):
+                                        self.print_error("LinkedIn cookies failed sanity check")
+                                        self.config['linkedin_cookies'] = ''
+                                        return
                                     self.config['linkedin_cookies'] = cookies
                                     if self._validate_api_token('linkedin'):
                                         self.print_success("LinkedIn cookies validated and saved")
@@ -2490,7 +3051,7 @@ class ReconAutomation:
                                 company_search_url = f"https://www.linkedin.com/voyager/api/voyagerSearchDashClusters?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-174&origin=SWITCH_SEARCH_VERTICAL&q=all&query=(keywords:{encoded_term},flagshipSearchIntent:SEARCH_SRP,queryParameters:(resultType:List(COMPANIES)),includeFiltersInResponse:false)&start={start}"
 
                                 try:
-                                    response = linkedin_session.get(company_search_url, headers=api_headers, timeout=15)
+                                    response = linkedin_session.get(company_search_url, headers=api_headers, timeout=15, allow_redirects=False)
                                     api_call_count += 1
 
                                     # Rate-limit detection
@@ -2505,6 +3066,11 @@ class ReconAutomation:
                                     if response.status_code in [401, 403]:
                                         rate_limit_triggered = True
                                         rate_limit_reason = f"HTTP {response.status_code} (auth invalidated)"
+                                        break
+                                    if 300 <= response.status_code < 400:
+                                        loc = response.headers.get('Location', '')
+                                        rate_limit_triggered = True
+                                        rate_limit_reason = f"HTTP {response.status_code} redirect (security check / challenge)" + (f" -> {loc}" if loc else "")
                                         break
 
                                     # Detect challenge/login redirect pages
@@ -2646,6 +3212,10 @@ class ReconAutomation:
                                     else:
                                         time.sleep(delay)
 
+                                except requests.exceptions.TooManyRedirects:
+                                    rate_limit_triggered = True
+                                    rate_limit_reason = "Redirect loop (security check / challenge)"
+                                    break
                                 except Exception as e:
                                     self.print_error(f"Error fetching companies: {e}")
                                     break
@@ -2726,6 +3296,44 @@ class ReconAutomation:
                         else:
                             self.print_warning("No companies found")
 
+                        # Employee-phase pacing (fresh entry only; reused on resume)
+                        employee_pacing = progress.get('employee_pacing')
+                        if employee_pacing is None:
+                            print("\n" + "="*80)
+                            print("EMPLOYEE SEARCH PACING")
+                            print("="*80)
+                            print("Employee search generates the most activity and is the most likely")
+                            print("phase to trip a LinkedIn security check. Paranoid pacing is recommended.")
+                            print()
+
+                            resp = self._prompt_with_timeout("    Use paranoid pacing for employee search? [Y/n]: ", 30, 'y').strip().lower()
+                            if resp in ('n', 'no'):
+                                custom = self._prompt_with_timeout("    Enter employee-search mode [fast/normal/paranoid]: ", 30, 'paranoid').strip().lower()
+                                employee_mode = custom if custom in delay_profiles else 'paranoid'
+                            else:
+                                employee_mode = 'paranoid'
+
+                            resp = self._prompt_with_timeout("    Employee-search session cap = 30. Keep? [Y/n]: ", 30, 'y').strip().lower()
+                            if resp in ('n', 'no'):
+                                custom = self._prompt_with_timeout("    Enter employee-search session cap: ", 30, '30').strip()
+                                try:
+                                    employee_cap = int(custom)
+                                    if employee_cap < 1:
+                                        employee_cap = 30
+                                except ValueError:
+                                    employee_cap = 30
+                            else:
+                                employee_cap = 30
+
+                            employee_pacing = {'mode': employee_mode, 'cap': employee_cap}
+                            self.checkpoint('linkedin_enumeration', 'employee_pacing', employee_pacing)
+                            print("="*80)
+
+                        employee_mode = employee_pacing.get('mode', 'paranoid')
+                        employee_cap = employee_pacing.get('cap', 30)
+                        employee_profile = delay_profiles.get(employee_mode, delay_profiles['paranoid'])
+                        self.print_info(f"Employee phase pacing: {employee_mode} (session cap: {employee_cap} employee API calls)")
+
                         # Brief pause before employee search starts (simulates "now searching for people")
                         time.sleep(random.uniform(3, 6))
 
@@ -2742,11 +3350,13 @@ class ReconAutomation:
                             self._linkedin_finalize(linkedin_intel, all_companies, api_call_count, '')
                             return
 
+                        employee_api_calls = 0
+
                         for company_idx, company in enumerate(companies_to_search, 1):
                             # Check session cap before each company
-                            if api_call_count >= profile['session_cap']:
+                            if employee_api_calls >= employee_cap:
                                 rate_limit_triggered = True
-                                rate_limit_reason = f"Session cap reached ({profile['session_cap']} API calls)"
+                                rate_limit_reason = f"Employee session cap reached ({employee_cap} API calls)"
                                 break
 
                             company_name = company['name']
@@ -2764,12 +3374,18 @@ class ReconAutomation:
                                 self.print_info(f"  Looking up company ID for {company_slug}...")
                                 try:
                                     company_lookup_url = f"https://www.linkedin.com/voyager/api/organization/companies?decorationId=com.linkedin.voyager.deco.organization.web.WebFullCompanyMain-21&q=universalName&universalName={company_slug}"
-                                    lookup_response = linkedin_session.get(company_lookup_url, headers=api_headers, timeout=15)
+                                    lookup_response = linkedin_session.get(company_lookup_url, headers=api_headers, timeout=15, allow_redirects=False)
                                     api_call_count += 1
+                                    employee_api_calls += 1
 
                                     if lookup_response.status_code in [429, 999, 401, 403]:
                                         rate_limit_triggered = True
                                         rate_limit_reason = f"HTTP {lookup_response.status_code} during company lookup"
+                                        break
+                                    if 300 <= lookup_response.status_code < 400:
+                                        loc = lookup_response.headers.get('Location', '')
+                                        rate_limit_triggered = True
+                                        rate_limit_reason = f"HTTP {lookup_response.status_code} redirect during company lookup (security check / challenge)" + (f" -> {loc}" if loc else "")
                                         break
 
                                     if lookup_response.status_code == 200:
@@ -2798,6 +3414,10 @@ class ReconAutomation:
                                                     self.print_success(f"  Found company ID: {company_id}")
 
                                     time.sleep(random.uniform(2, 4))
+                                except requests.exceptions.TooManyRedirects:
+                                    rate_limit_triggered = True
+                                    rate_limit_reason = "Redirect loop during company lookup (security check / challenge)"
+                                    break
                                 except Exception as e:
                                     self.print_warning(f"  Company lookup failed: {e}")
 
@@ -2814,16 +3434,17 @@ class ReconAutomation:
 
                             while start < max_per_company:
                                 # Check session cap
-                                if api_call_count >= profile['session_cap']:
+                                if employee_api_calls >= employee_cap:
                                     rate_limit_triggered = True
-                                    rate_limit_reason = f"Session cap reached ({profile['session_cap']} API calls)"
+                                    rate_limit_reason = f"Employee session cap reached ({employee_cap} API calls)"
                                     break
 
                                 people_search_url = f"https://www.linkedin.com/voyager/api/voyagerSearchDashClusters?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-174&origin=SWITCH_SEARCH_VERTICAL&q=all&query=(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List({company_id}),resultType:List(PEOPLE)),includeFiltersInResponse:false)&start={start}"
 
                                 try:
-                                    response = linkedin_session.get(people_search_url, headers=api_headers, timeout=15)
+                                    response = linkedin_session.get(people_search_url, headers=api_headers, timeout=15, allow_redirects=False)
                                     api_call_count += 1
+                                    employee_api_calls += 1
 
                                     # Rate-limit detection
                                     if response.status_code == 429:
@@ -2837,6 +3458,11 @@ class ReconAutomation:
                                     if response.status_code in [401, 403]:
                                         rate_limit_triggered = True
                                         rate_limit_reason = f"HTTP {response.status_code} (auth invalidated)"
+                                        break
+                                    if 300 <= response.status_code < 400:
+                                        loc = response.headers.get('Location', '')
+                                        rate_limit_triggered = True
+                                        rate_limit_reason = f"HTTP {response.status_code} redirect (security check / challenge)" + (f" -> {loc}" if loc else "")
                                         break
 
                                     # Detect challenge/login redirect pages
@@ -2946,7 +3572,7 @@ class ReconAutomation:
                                             company_employees.append(emp)
                                             new_count += 1
 
-                                    self.print_info(f"  Page {start // page_size + 1}: Found {new_count} new employees (total: {len(company_employees)}, API calls: {api_call_count})")
+                                    self.print_info(f"  Page {start // page_size + 1}: Found {new_count} new employees (total: {len(company_employees)}, employee API calls: {employee_api_calls})")
 
                                     if new_count == 0:
                                         break
@@ -2954,16 +3580,20 @@ class ReconAutomation:
                                     start += page_size
 
                                     # Per-page delay with jitter
-                                    delay = random.uniform(profile['page_min'], profile['page_max'])
+                                    delay = random.uniform(employee_profile['page_min'], employee_profile['page_max'])
 
                                     # Occasional long pause
-                                    if profile['long_pause_prob'] > 0 and random.random() < profile['long_pause_prob']:
-                                        long_pause = random.uniform(profile['long_pause_min'], profile['long_pause_max'])
+                                    if employee_profile['long_pause_prob'] > 0 and random.random() < employee_profile['long_pause_prob']:
+                                        long_pause = random.uniform(employee_profile['long_pause_min'], employee_profile['long_pause_max'])
                                         self.print_info(f"  (Long read pause: {long_pause:.0f}s)")
                                         time.sleep(long_pause)
                                     else:
                                         time.sleep(delay)
 
+                                except requests.exceptions.TooManyRedirects:
+                                    rate_limit_triggered = True
+                                    rate_limit_reason = "Redirect loop (security check / challenge)"
+                                    break
                                 except Exception as e:
                                     self.print_error(f"Error fetching people: {e}")
                                     break
@@ -2984,7 +3614,7 @@ class ReconAutomation:
 
                             # Between-company break (only if more companies remain)
                             if company_idx < len(companies_to_search):
-                                company_break = random.uniform(profile['company_break_min'], profile['company_break_max'])
+                                company_break = random.uniform(employee_profile['company_break_min'], employee_profile['company_break_max'])
                                 self.print_info(f"  (Pausing {company_break:.0f}s before next company)")
                                 time.sleep(company_break)
 
@@ -3025,6 +3655,7 @@ class ReconAutomation:
             self.print_info(f"  Total API calls: {api_call_count}")
 
             if rate_limit_reason:
+                first_call_failure = api_call_count == 0
                 print("")
                 self.print_warning("="*80)
                 self.print_warning("LINKEDIN RATE LIMIT / DETECTION TRIGGERED")
@@ -3033,11 +3664,19 @@ class ReconAutomation:
                 self.print_warning(f"API calls made before stopping: {api_call_count}")
                 self.print_warning(f"Partial results saved to results['linkedin_intel']")
                 self.print_warning("")
-                self.print_warning("Recommendations before retrying:")
-                self.print_warning("  1. Wait at least 1-2 hours before next run")
-                self.print_warning("  2. Use a fresh cookie set from a different browser session")
-                self.print_warning("  3. Consider switching to --linkedin-mode paranoid")
-                self.print_warning("  4. Verify the LinkedIn account is not locked (log in via browser)")
+                if first_call_failure:
+                    self.print_warning("Detection hit on the FIRST call - this usually means a bad or expired")
+                    self.print_warning("session, not a soft block. Recommended:")
+                    self.print_warning("  1. Log into linkedin.com in a browser and clear any security check")
+                    self.print_warning("  2. Pull a fresh cookie set from a plain linkedin.com/feed tab")
+                    self.print_warning("  3. Confirm the account is not locked before retrying")
+                else:
+                    self.print_warning("Detection hit AFTER successful calls - this looks like a soft block on")
+                    self.print_warning("activity pattern. Recommended:")
+                    self.print_warning("  1. Wait several hours before the next run")
+                    self.print_warning("  2. Re-run employee search with paranoid pacing and a lower cap")
+                    self.print_warning("  3. Pull a fresh cookie set if the wait does not clear it")
+                    self.print_warning("  4. Verify the account is not locked (log in via browser)")
                 self.print_warning("="*80)
 
     def run_linkedin_only(self):
@@ -3055,6 +3694,9 @@ class ReconAutomation:
                 print("    4. In Request Headers, find 'Cookie:' and copy the ENTIRE value")
                 cookies = input("    Enter full LinkedIn cookie string (or press Enter to skip): ").strip()
                 if cookies:
+                    if not self._sanity_check_linkedin_cookies(cookies):
+                        self.print_error("LinkedIn cookies failed sanity check. Exiting.")
+                        return
                     self.config['linkedin_cookies'] = cookies
                     self.print_success("LinkedIn cookies configured")
                 else:
@@ -3234,11 +3876,19 @@ class ReconAutomation:
         return False
 
     def asn_enumeration(self):
-            """Enumerate ASN and associated IP ranges for the organization"""
+            """Enumerate ASN and associated IP ranges for the organization.
+
+            Cloud, CDN, and shared-hosting ASNs are classified and attributed to the
+            provider rather than the client. Their prefixes are never recorded as org
+            ranges. Only ASNs that pass ownership classification are expanded, and only
+            when ownership confidence is high. Announced prefixes are split into authorized
+            scope and candidate scope. Candidate ranges are documented for the scope
+            conversation and are never tested."""
             self.print_section("ASN ENUMERATION")
 
             asn_data = {
                 'asn_numbers': [],
+                'hosting_providers': [],
                 'ip_ranges': [],
                 'organization_names': set(),
                 'related_domains': []
@@ -3297,15 +3947,50 @@ class ReconAutomation:
                 except Exception as e:
                     self.print_error(f"Error looking up ASN for {ip}: {e}")
 
-            # Display results grouped by ASN
-            self.print_info(f"\nDiscovered {len(asn_to_ips)} unique ASN(s):\n")
+            # Build client/domain tokens for ownership-confidence scoring. An org ASN is
+            # credibly org-owned when its owner string carries the client or domain name,
+            # or when multiple discovered IPs across subdomains share it.
+            owner_tokens = set()
+            for tok in re.split(r'[^a-z0-9]+', (self.client_name or '').lower()):
+                if len(tok) >= 3:
+                    owner_tokens.add(tok)
+            for d in self.domains:
+                label = d.lower().split('.')[0]
+                if len(label) >= 3:
+                    owner_tokens.add(label)
+
+            org_asns = []
+            self.print_info(f"\nClassified {len(asn_to_ips)} unique ASN(s):\n")
 
             for asn_num, data in sorted(asn_to_ips.items()):
                 info = data['info']
                 ips = data['ips']
                 prefixes = data['prefixes']
+                owner = info.get('owner', 'Unknown')
 
-                self.print_success(f"AS{asn_num} - {info.get('owner', 'Unknown')}")
+                classification = self._classify_asn(asn_num, owner)
+
+                # Hosting/CDN/shared: attribute to provider, never treat as org infrastructure
+                if classification['hosting']:
+                    self.print_info(f"AS{asn_num} - {owner} [provider: {classification['provider']}]")
+                    self.print_info(f"  Attributed to hosting/CDN provider - not treated as org infrastructure")
+                    shown = ', '.join(ips[:5]) + (' ...' if len(ips) > 5 else '')
+                    self.print_info(f"  Discovered IPs ({len(ips)}): {shown}")
+                    asn_data['hosting_providers'].append({
+                        'asn': asn_num,
+                        'owner': owner,
+                        'provider': classification['provider'],
+                        'discovered_ips': ips
+                    })
+                    print()
+                    continue
+
+                # Org-owned candidate. Score ownership confidence.
+                owner_l = owner.lower()
+                name_match = any(tok in owner_l for tok in owner_tokens)
+                confidence = 'high' if (name_match or len(ips) >= 2) else 'low'
+
+                self.print_success(f"AS{asn_num} - {owner} [org-owned, confidence: {confidence}]")
                 if info.get('country'):
                     self.print_info(f"  Country: {info['country']}")
                 self.print_info(f"  Registry: {info.get('registry', 'Unknown')}")
@@ -3315,40 +4000,54 @@ class ReconAutomation:
                 if len(ips) > 10:
                     self.print_info(f"    ... and {len(ips) - 10} more")
 
-                self.print_info(f"  Announced Prefixes containing discovered IPs:")
+                self.print_info(f"  Announced prefixes containing discovered IPs:")
                 for prefix in sorted(prefixes):
                     self.print_info(f"    - {prefix}")
 
-                # Add to results
                 asn_entry = {
                     'asn': asn_num,
-                    'owner': info.get('owner', 'Unknown'),
+                    'owner': owner,
                     'country': info.get('country', 'Unknown'),
                     'registry': info.get('registry', 'Unknown'),
                     'discovered_ips': ips,
+                    'ownership_confidence': confidence,
                     'source': 'dns_resolution'
                 }
 
                 if asn_entry not in asn_data['asn_numbers']:
                     asn_data['asn_numbers'].append(asn_entry)
 
-                asn_data['organization_names'].add(info.get('owner', 'Unknown'))
+                asn_data['organization_names'].add(owner)
+                org_asns.append((asn_num, confidence))
 
                 for prefix in prefixes:
                     asn_data['ip_ranges'].append({
                         'prefix': prefix,
                         'asn': asn_num,
+                        'scope': 'discovered',
+                        'org_owned': True,
                         'contains_discovered_ips': True,
                         'discovered_ips_in_prefix': [ip for ip in ips if self._ip_in_prefix(ip, prefix)]
                     })
 
                 print()
 
-            # Only fetch additional prefixes if IP ranges were explicitly provided
-            if self.ip_ranges:
-                self.print_info("Checking for additional prefixes within authorized scope...")
+            # Expansion: pull announced prefixes for high-confidence org ASNs by default.
+            # This is the pivot value - netblocks not already known. Split into authorized
+            # (overlaps -i scope) and candidate (documented, never tested). Hosting/CDN ASNs
+            # are never expanded. Low-confidence org ASNs are skipped to avoid dumping a
+            # provider's space on a single ambiguous hit.
+            expand_targets = [a for a, c in org_asns if c == 'high']
+            CANDIDATE_CAP = 500
+            candidate_count = 0
+            truncated = False
 
-                for asn_num, data in asn_to_ips.items():
+            if expand_targets:
+                self.print_info(f"\nExpanding announced prefixes for {len(expand_targets)} high-confidence org ASN(s)...")
+
+                for asn_num in expand_targets:
+                    if truncated:
+                        break
                     max_retries = 3
                     retry_count = 0
                     success = False
@@ -3362,21 +4061,35 @@ class ReconAutomation:
                                 ripe_data = response.json()
                                 prefixes = ripe_data.get('data', {}).get('prefixes', [])
 
-                                in_scope_count = 0
                                 for prefix in prefixes:
                                     prefix_str = prefix.get('prefix')
-                                    if prefix_str and self._check_if_in_scope(prefix_str):
-                                        in_scope_count += 1
-                                        # Only add if not already tracked
-                                        existing = [r for r in asn_data['ip_ranges'] if r['prefix'] == prefix_str]
-                                        if not existing:
-                                            asn_data['ip_ranges'].append({
-                                                'prefix': prefix_str,
-                                                'asn': asn_num,
-                                                'in_scope': True,
-                                                'contains_discovered_ips': False
-                                            })
-                                            self.print_info(f"  Additional in-scope prefix: {prefix_str} (AS{asn_num})")
+                                    if not prefix_str:
+                                        continue
+                                    if any(r['prefix'] == prefix_str for r in asn_data['ip_ranges']):
+                                        continue
+
+                                    in_scope = bool(self.ip_ranges) and self._check_if_in_scope(prefix_str)
+                                    if in_scope:
+                                        asn_data['ip_ranges'].append({
+                                            'prefix': prefix_str,
+                                            'asn': asn_num,
+                                            'scope': 'authorized',
+                                            'org_owned': True,
+                                            'contains_discovered_ips': False
+                                        })
+                                        self.print_info(f"  Authorized-scope prefix: {prefix_str} (AS{asn_num})")
+                                    else:
+                                        if candidate_count >= CANDIDATE_CAP:
+                                            truncated = True
+                                            break
+                                        asn_data['ip_ranges'].append({
+                                            'prefix': prefix_str,
+                                            'asn': asn_num,
+                                            'scope': 'candidate',
+                                            'org_owned': True,
+                                            'contains_discovered_ips': False
+                                        })
+                                        candidate_count += 1
 
                                 success = True
 
@@ -3390,6 +4103,9 @@ class ReconAutomation:
                             retry_count += 1
                             if retry_count < max_retries:
                                 time.sleep(2)
+
+                if truncated:
+                    self.print_warning(f"  Candidate prefix cap ({CANDIDATE_CAP}) reached - list truncated")
 
             # Reverse DNS for related domains
             self.print_info("\nSearching for related domains via reverse DNS...")
@@ -3410,16 +4126,23 @@ class ReconAutomation:
             # Store results
             self.results['asn_data'] = {
                 'asn_numbers': asn_data['asn_numbers'],
+                'hosting_providers': asn_data['hosting_providers'],
                 'ip_ranges': asn_data['ip_ranges'],
                 'organization_names': list(asn_data['organization_names']),
                 'related_domains': asn_data['related_domains']
             }
 
             # Summary
+            authorized_ct = len([r for r in asn_data['ip_ranges'] if r.get('scope') == 'authorized'])
+            candidate_ct = len([r for r in asn_data['ip_ranges'] if r.get('scope') == 'candidate'])
+            discovered_ct = len([r for r in asn_data['ip_ranges'] if r.get('scope') == 'discovered'])
             self.print_info(f"\nASN Enumeration Summary:")
             self.print_info(f"  Public IPs analyzed: {len(public_ips)}")
-            self.print_info(f"  Unique ASNs discovered: {len(asn_to_ips)}")
-            self.print_info(f"  IP prefixes identified: {len(asn_data['ip_ranges'])}")
+            self.print_info(f"  Org-owned ASNs: {len(asn_data['asn_numbers'])}")
+            self.print_info(f"  Hosting/CDN ASNs (attributed, not expanded): {len(asn_data['hosting_providers'])}")
+            self.print_info(f"  Prefixes containing discovered IPs: {discovered_ct}")
+            self.print_info(f"  Authorized-scope prefixes: {authorized_ct}")
+            self.print_info(f"  Candidate prefixes (documented, not tested): {candidate_ct}")
             self.print_info(f"  Related domains found: {len(asn_data['related_domains'])}")
 
     def _ip_in_prefix(self, ip: str, prefix: str) -> bool:
@@ -3475,6 +4198,20 @@ class ReconAutomation:
             return False
         except:
             return False
+
+    def _classify_asn(self, asn_num: str, owner: str) -> Dict[str, Any]:
+        """Classify an ASN as hosting/CDN/shared or organization-owned.
+
+        Returns {'hosting': bool, 'provider': str}. Hosting ASNs are attributed to the
+        provider and never expanded into org ranges. Matching is by known ASN number or
+        owner substring against the provider sets."""
+        owner_l = (owner or '').lower()
+        if str(asn_num) in self.HOSTING_ASN_NUMBERS:
+            return {'hosting': True, 'provider': owner or f"AS{asn_num}"}
+        for token in self.HOSTING_ASN_OWNERS:
+            if token in owner_l:
+                return {'hosting': True, 'provider': owner or token}
+        return {'hosting': False, 'provider': ''}
 
     def dns_enumeration(self):
                     """Perform DNS enumeration to discover subdomains with checkpoint support"""
@@ -3749,6 +4486,184 @@ class ReconAutomation:
                         self.print_info(f"  - In authorized IP scope: {len(resolved_in_authorized_scope)}")
                     if whois_results:
                         self.print_info(f"WHOIS lookups completed: {len(whois_results)} IPs across {len(org_summary)} organizations")
+
+    def ct_scope_correlation(self):
+        """Correlate CT-discovered names with the authorized IP scope and classify each name."""
+        self.print_section("CT LOG TO SCOPE CORRELATION")
+
+        if not self.ip_ranges:
+            self.print_warning("Skipping CT correlation (no IP ranges provided)")
+            return
+
+        dns = self.results.get('dns_enumeration', {})
+        ct_names = dns.get('ct_log_domains', [])
+        resolved = dns.get('resolved', {})
+
+        if not ct_names:
+            self.print_warning("No CT log domains available. Run DNS enumeration first.")
+            self.results['ct_scope_correlation'] = {
+                'in_scope': {}, 'cdn_fronted': {}, 'out_of_scope': {},
+                'unresolved': [], 'by_scope_ip': {}, 'ptr_matches': {}
+            }
+            return
+
+        resume_data = self.get_resume_data('ct_scope_correlation')
+        progress = resume_data.get('progress', {})
+
+        in_scope = progress.get('in_scope', {})
+        cdn_fronted = progress.get('cdn_fronted', {})
+        out_of_scope = progress.get('out_of_scope', {})
+        unresolved = progress.get('unresolved', [])
+        classified = set(progress.get('classified', []))
+        asn_cache = progress.get('asn_cache', {})
+
+        # CDN and hosting providers whose edge addresses mask the real origin
+        cdn_keywords = [
+            'cloudflare', 'akamai', 'fastly', 'cloudfront', 'amazon',
+            'incapsula', 'imperva', 'sucuri', 'stackpath', 'limelight',
+            'edgecast', 'verizon', 'google', 'azure', 'microsoft',
+            'azion', 'bunny', 'keycdn', 'cachefly', 'section'
+        ]
+
+        self.print_info(f"Correlating {len(ct_names)} CT names against {len(self.ip_ranges)} scope range(s)...")
+
+        names_to_process = [n for n in ct_names if n not in classified]
+
+        for name in names_to_process:
+            ips = resolved.get(name)
+            if ips is None:
+                ips = self._resolve_domain(name)
+
+            if not ips:
+                if name not in unresolved:
+                    unresolved.append(name)
+                classified.add(name)
+                continue
+
+            scope_ips = [ip for ip in ips if self._is_ip_in_scope(ip)]
+
+            if scope_ips:
+                matched_ranges = set()
+                for ip in scope_ips:
+                    for ip_range in self.ip_ranges:
+                        try:
+                            if ipaddress.ip_address(ip) in ipaddress.ip_network(ip_range, strict=False):
+                                matched_ranges.add(ip_range)
+                                break
+                        except (ValueError, TypeError):
+                            continue
+                in_scope[name] = {
+                    'ips': ips,
+                    'scope_ips': scope_ips,
+                    'matched_ranges': sorted(matched_ranges)
+                }
+                self.print_success(f"IN SCOPE: {name} -> {', '.join(scope_ips)}")
+            else:
+                provider = None
+                is_cdn = False
+                for ip in ips:
+                    try:
+                        if ip in asn_cache:
+                            owner = asn_cache[ip]
+                        else:
+                            info = self._lookup_asn_cymru(ip)
+                            owner = (info or {}).get('owner', '') if info else ''
+                            asn_cache[ip] = owner
+                            time.sleep(0.3)
+                        if owner:
+                            owner_lower = owner.lower()
+                            if any(kw in owner_lower for kw in cdn_keywords):
+                                is_cdn = True
+                                provider = owner
+                                break
+                            provider = provider or owner
+                    except Exception:
+                        continue
+
+                if is_cdn:
+                    cdn_fronted[name] = {'ips': ips, 'provider': provider}
+                    self.print_warning(f"CDN FRONTED: {name} -> {', '.join(ips)} ({provider})")
+                else:
+                    out_of_scope[name] = {'ips': ips, 'provider': provider or 'Unknown'}
+                    self.print_info(f"OUT OF SCOPE: {name} -> {', '.join(ips)}")
+
+            classified.add(name)
+
+            if len(classified) % 25 == 0:
+                self.checkpoint('ct_scope_correlation', 'in_scope', in_scope)
+                self.checkpoint('ct_scope_correlation', 'cdn_fronted', cdn_fronted)
+                self.checkpoint('ct_scope_correlation', 'out_of_scope', out_of_scope)
+                self.checkpoint('ct_scope_correlation', 'unresolved', unresolved)
+                self.checkpoint('ct_scope_correlation', 'classified', list(classified))
+                self.checkpoint('ct_scope_correlation', 'asn_cache', asn_cache)
+
+        # Reverse PTR pass over scope IPs, cross referenced against the CT set
+        self.print_info("\nPerforming reverse PTR lookups on in-scope IPs...")
+        ct_name_set = set(n.lower() for n in ct_names)
+        ptr_matches = progress.get('ptr_matches', {})
+
+        scope_ip_list = []
+        for ip_range in self.ip_ranges:
+            try:
+                net = ipaddress.ip_network(ip_range, strict=False)
+                # Bound expansion so a large range does not stall the PTR sweep
+                if net.num_addresses > 1024:
+                    self.print_info(f"  Skipping PTR sweep of {ip_range} (larger than /22)")
+                    continue
+                for host in net.hosts():
+                    scope_ip_list.append(str(host))
+            except (ValueError, TypeError):
+                continue
+
+        for ip in scope_ip_list:
+            try:
+                hostname = socket.gethostbyaddr(ip)[0].lower().rstrip('.')
+            except Exception:
+                continue
+            if not hostname:
+                continue
+            match_in_ct = hostname in ct_name_set
+            ptr_matches[ip] = {'ptr': hostname, 'in_ct_set': match_in_ct}
+            if match_in_ct:
+                self.print_success(f"PTR match: {ip} -> {hostname} (present in CT set)")
+
+        # IP-anchored view built from in-scope names then folded with PTR-only hits
+        by_scope_ip = {}
+        for name, data in in_scope.items():
+            for ip in data['scope_ips']:
+                by_scope_ip.setdefault(ip, [])
+                if name not in by_scope_ip[ip]:
+                    by_scope_ip[ip].append(name)
+
+        for ip, pdata in ptr_matches.items():
+            if pdata.get('in_ct_set'):
+                by_scope_ip.setdefault(ip, [])
+                if pdata['ptr'] not in by_scope_ip[ip]:
+                    by_scope_ip[ip].append(pdata['ptr'])
+
+        self.results['ct_scope_correlation'] = {
+            'in_scope': in_scope,
+            'cdn_fronted': cdn_fronted,
+            'out_of_scope': out_of_scope,
+            'unresolved': sorted(unresolved),
+            'by_scope_ip': by_scope_ip,
+            'ptr_matches': ptr_matches
+        }
+
+        self.checkpoint('ct_scope_correlation', 'in_scope', in_scope)
+        self.checkpoint('ct_scope_correlation', 'cdn_fronted', cdn_fronted)
+        self.checkpoint('ct_scope_correlation', 'out_of_scope', out_of_scope)
+        self.checkpoint('ct_scope_correlation', 'unresolved', unresolved)
+        self.checkpoint('ct_scope_correlation', 'classified', list(classified))
+        self.checkpoint('ct_scope_correlation', 'asn_cache', asn_cache)
+        self.checkpoint('ct_scope_correlation', 'ptr_matches', ptr_matches)
+
+        self.print_info(f"\nCT Scope Correlation Summary:")
+        self.print_success(f"  In scope: {len(in_scope)}")
+        self.print_warning(f"  CDN fronted (origin may be in scope): {len(cdn_fronted)}")
+        self.print_info(f"  Out of scope: {len(out_of_scope)}")
+        self.print_info(f"  Unresolved: {len(unresolved)}")
+        self.print_info(f"  Scope IPs with matching CT names: {len(by_scope_ip)}")
 
     def subdomain_takeover_detection(self):
                 """Check for subdomain takeover vulnerabilities with validation"""
@@ -6850,6 +7765,68 @@ class ReconAutomation:
                         f.write(f"## M365/Azure AD Tenant Attribution\n\n")
                         f.write(f"Domain does not appear to be associated with an M365/Azure AD tenant.\n\n")
 
+                    # M365/Azure AD Enrichment
+                    enrich = self.results.get('m365_enrichment', {})
+                    if enrich and enrich.get('ran'):
+                        f.write(f"## M365/Azure AD Enrichment\n\n")
+
+                        vd = enrich.get('verified_domains', {})
+                        f.write(f"### Verified Tenant Domains\n\n")
+                        f.write(f"- **Total verified/federated domains:** {vd.get('count', 0)}\n")
+                        if vd.get('tenant_default_domain'):
+                            f.write(f"- **Tenant default domain:** {vd['tenant_default_domain']}\n")
+                        f.write(f"- **In authorized scope:** {len(vd.get('in_scope', []))}\n")
+                        f.write(f"- **Out of authorized scope:** {len(vd.get('out_of_scope', []))}\n\n")
+                        if vd.get('in_scope'):
+                            f.write(f"**In-scope domains (testable under current authorization):**\n\n")
+                            for d in vd['in_scope']:
+                                f.write(f"- {d}\n")
+                            f.write("\n")
+                        if vd.get('out_of_scope'):
+                            f.write(f"**Out-of-scope domains (additional attack surface and phishing pretext, require authorization before testing):**\n\n")
+                            for d in vd['out_of_scope']:
+                                f.write(f"- {d}\n")
+                            f.write("\n")
+
+                        tc = enrich.get('tenant_config', {})
+                        f.write(f"### Tenant Configuration\n\n")
+                        f.write(f"- **Seamless SSO (DesktopSsoEnabled):** {'Enabled' if tc.get('desktop_sso_enabled') else 'Not advertised'}\n")
+                        if tc.get('throttle_status') not in (None, 0):
+                            f.write(f"- **Throttling:** active (ThrottleStatus={tc['throttle_status']}); factor into spray pacing\n")
+                        if tc.get('domain_type') is not None:
+                            f.write(f"- **DomainType:** {tc['domain_type']}\n")
+                        f.write(f"- **Custom branding present:** {'Yes' if tc.get('branding_present') else 'No'}\n")
+                        if tc.get('boilerplate_text'):
+                            f.write(f"- **Sign-in boilerplate text (pretext value):** {tc['boilerplate_text']}\n")
+                        f.write("\n")
+
+                        las = enrich.get('legacy_auth_surface', {})
+                        f.write(f"### Legacy-Auth Surface\n\n")
+                        f.write(f"- **Basic auth offered at service layer:** {'Yes' if las.get('basic_auth_offered') else 'No'}\n")
+                        f.write(f"- **Legacy v1 token endpoint reachable:** {'Yes' if las.get('legacy_token_endpoint_present') else 'No'}\n")
+                        eps = las.get('endpoints', {})
+                        for name, info in eps.items():
+                            if info.get('schemes'):
+                                f.write(f"- **{name.upper()}:** status {info.get('status')}, schemes {', '.join(info['schemes'])}\n")
+                        f.write(f"\n**Note:** Basic being offered at the shared Exchange Online endpoint means legacy auth is not blocked service-side. Per-tenant Conditional Access still governs enforcement and must be confirmed with an authenticated probe before a legacy-auth phase. Treat this as a go / no-go gate, not proof of policy.\n\n")
+
+                        hs = enrich.get('hybrid_signal', {})
+                        f.write(f"### Hybrid / On-Premises Signal\n\n")
+                        f.write(f"- **Assessment:** {hs.get('assessment', 'Unknown')}\n")
+                        f.write(f"- **Seamless SSO:** {'Yes' if hs.get('seamless_sso') else 'No'}\n")
+                        if hs.get('mx_routing'):
+                            f.write(f"- **MX routing:** {hs['mx_routing']}\n")
+                        if hs.get('mx_hosts'):
+                            f.write(f"- **MX hosts:** {', '.join(hs['mx_hosts'])}\n")
+                        if hs.get('autodiscover_routing'):
+                            f.write(f"- **Autodiscover routing:** {hs['autodiscover_routing']}\n")
+                        if hs.get('autodiscover_cname'):
+                            f.write(f"- **Autodiscover CNAME:** {hs['autodiscover_cname']}\n")
+                        f.write(f"- **Device registration configured:** {'Yes' if hs.get('device_registration') else 'No'}\n")
+                        if hs.get('spf_onprem_mechanisms'):
+                            f.write(f"- **Non-Microsoft SPF mechanisms:** {', '.join(hs['spf_onprem_mechanisms'])}\n")
+                        f.write("\n")
+
                     # Email Security Posture (SPF/DKIM/DMARC)
                     email_sec = self.results.get('email_security', {})
                     if email_sec:
@@ -7084,6 +8061,72 @@ class ReconAutomation:
                                 f.write(f"- **Network Ranges:** {', '.join(data['netranges'])}\n")
                             f.write(f"\n")
 
+                    # CT Log to Scope Correlation
+                    ct_corr = self.results.get('ct_scope_correlation', {})
+                    if ct_corr and self.ip_ranges:
+                        in_scope_names = ct_corr.get('in_scope', {})
+                        cdn_fronted = ct_corr.get('cdn_fronted', {})
+                        out_of_scope = ct_corr.get('out_of_scope', {})
+                        unresolved = ct_corr.get('unresolved', [])
+                        by_scope_ip = ct_corr.get('by_scope_ip', {})
+                        ptr_matches = ct_corr.get('ptr_matches', {})
+
+                        f.write(f"## CT Log to Scope Correlation\n\n")
+                        f.write(f"**In Scope:** {len(in_scope_names)} | ")
+                        f.write(f"**CDN Fronted:** {len(cdn_fronted)} | ")
+                        f.write(f"**Out of Scope:** {len(out_of_scope)} | ")
+                        f.write(f"**Unresolved:** {len(unresolved)}\n\n")
+
+                        if by_scope_ip:
+                            f.write(f"### In-Scope IPs and Matching CT Names ({len(by_scope_ip)})\n\n")
+                            for ip in sorted(by_scope_ip.keys()):
+                                f.write(f"#### {ip}\n")
+                                for n in sorted(by_scope_ip[ip]):
+                                    f.write(f"- `{n}`\n")
+                                f.write(f"\n")
+
+                        if in_scope_names:
+                            f.write(f"### CT Names In Authorized Scope ({len(in_scope_names)})\n\n")
+                            for name, data in sorted(in_scope_names.items()):
+                                ips_str = ', '.join(data.get('scope_ips', []))
+                                ranges_str = ', '.join(data.get('matched_ranges', []))
+                                f.write(f"- `{name}` -> {ips_str} (scope: {ranges_str})\n")
+                            f.write(f"\n")
+
+                        if cdn_fronted:
+                            f.write(f"### CDN-Fronted CT Names ({len(cdn_fronted)}) - ORIGIN MAY BE IN SCOPE\n\n")
+                            f.write(f"These names resolve to CDN or hosting edge addresses outside the scope ranges. ")
+                            f.write(f"The origin server may still reside within the authorized scope and warrants manual origin discovery.\n\n")
+                            for name, data in sorted(cdn_fronted.items()):
+                                ips_str = ', '.join(data.get('ips', []))
+                                f.write(f"- `{name}` -> {ips_str} ({data.get('provider', 'Unknown')})\n")
+                            f.write(f"\n")
+
+                        if out_of_scope:
+                            f.write(f"### Out-of-Scope CT Names ({len(out_of_scope)})\n\n")
+                            for name, data in sorted(out_of_scope.items()):
+                                ips_str = ', '.join(data.get('ips', []))
+                                f.write(f"- `{name}` -> {ips_str}\n")
+                            f.write(f"\n")
+
+                        if unresolved:
+                            f.write(f"### Unresolved CT Names ({len(unresolved)})\n\n")
+                            f.write(f"Present in certificate transparency logs but not resolvable via public DNS. ")
+                            f.write(f"May be stale certificates or internal-only hostnames.\n\n")
+                            for name in sorted(unresolved)[:100]:
+                                f.write(f"- `{name}`\n")
+                            if len(unresolved) > 100:
+                                f.write(f"- ... and {len(unresolved) - 100} more\n")
+                            f.write(f"\n")
+
+                        ptr_hits = {ip: d for ip, d in ptr_matches.items() if d.get('in_ct_set')}
+                        if ptr_hits:
+                            f.write(f"### Reverse PTR Matches ({len(ptr_hits)})\n\n")
+                            f.write(f"Scope IPs whose PTR record matches a name in the CT set.\n\n")
+                            for ip in sorted(ptr_hits.keys()):
+                                f.write(f"- {ip} -> `{ptr_hits[ip]['ptr']}`\n")
+                            f.write(f"\n")
+
                     # Subdomain Takeover
                     f.write(f"## Subdomain Takeover Vulnerabilities\n\n")
                     takeovers = self.results.get('subdomain_takeovers', [])
@@ -7270,30 +8313,44 @@ class ReconAutomation:
                     asn_data = self.results.get('asn_data', {})
 
                     asns = asn_data.get('asn_numbers', [])
+                    hosting = asn_data.get('hosting_providers', [])
                     if asns:
-                        f.write(f"**ASNs Discovered:** {len(asns)}\n\n")
+                        f.write(f"**Org-owned ASNs:** {len(asns)}\n\n")
                         for asn in asns:
                             f.write(f"### AS{asn['asn']}\n")
                             f.write(f"- **Owner:** {asn['owner']}\n")
                             if asn.get('country'):
                                 f.write(f"- **Country:** {asn['country']}\n")
+                            if asn.get('ownership_confidence'):
+                                f.write(f"- **Ownership confidence:** {asn['ownership_confidence']}\n")
                             f.write(f"\n")
+
+                    if hosting:
+                        f.write(f"### Provider-Attributed ASNs ({len(hosting)})\n\n")
+                        f.write(f"Discovered hosts resolving into cloud, CDN, or shared-hosting space. Attributed to the provider and excluded from organization infrastructure.\n\n")
+                        for h in hosting:
+                            f.write(f"- AS{h['asn']} {h['owner']} ({len(h['discovered_ips'])} IP(s))\n")
+                        f.write(f"\n")
 
                     ip_ranges = asn_data.get('ip_ranges', [])
                     if ip_ranges:
+                        authorized = [r for r in ip_ranges if r.get('scope') == 'authorized']
+                        discovered = [r for r in ip_ranges if r.get('scope') == 'discovered']
+                        candidate = [r for r in ip_ranges if r.get('scope') == 'candidate']
                         f.write(f"### IP Ranges ({len(ip_ranges)})\n\n")
-                        in_scope = [r for r in ip_ranges if r.get('in_scope') or r.get('contains_discovered_ips')]
-                        out_scope = [r for r in ip_ranges if not r.get('in_scope') and not r.get('contains_discovered_ips')]
 
-                        if in_scope:
-                            f.write(f"#### In Authorized Scope ({len(in_scope)})\n\n")
-                            for r in in_scope:
+                        if authorized or discovered:
+                            f.write(f"#### In Authorized Scope ({len(authorized) + len(discovered)})\n\n")
+                            for r in discovered:
+                                f.write(f"- {r['prefix']} (AS{r['asn']}) - contains discovered host(s)\n")
+                            for r in authorized:
                                 f.write(f"- {r['prefix']} (AS{r['asn']})\n")
                             f.write(f"\n")
 
-                        if out_scope:
-                            f.write(f"#### Out of Scope - DO NOT TEST ({len(out_scope)})\n\n")
-                            for r in out_scope:
+                        if candidate:
+                            f.write(f"#### Candidate Scope - DOCUMENT, DO NOT TEST ({len(candidate)})\n\n")
+                            f.write(f"Announced by org-owned ASNs but outside the authorized ranges. Surface for the scope conversation before any testing.\n\n")
+                            for r in candidate:
                                 f.write(f"- {r['prefix']} (AS{r['asn']})\n")
                             f.write(f"\n")
 
@@ -7488,6 +8545,69 @@ class ReconAutomation:
                             f.write("for password spray attacks, valid-user enumeration, and conditional access ")
                             f.write("policy assessment.\n\n")
 
+                    # M365/Azure AD Enrichment Narrative
+                    enrich = self.results.get('m365_enrichment', {})
+                    if enrich and enrich.get('ran'):
+                        vd = enrich.get('verified_domains', {})
+                        tc = enrich.get('tenant_config', {})
+                        las = enrich.get('legacy_auth_surface', {})
+                        hs = enrich.get('hybrid_signal', {})
+
+                        f.write("### M365/Azure AD Enrichment\n\n")
+
+                        if vd.get('count'):
+                            f.write(f"Passive enumeration of the tenant through the Autodiscover ")
+                            f.write(f"GetFederationInformation endpoint returned {vd['count']} verified or federated ")
+                            f.write(f"domains. Of these, {len(vd.get('in_scope', []))} fall within the current authorized ")
+                            f.write(f"scope and {len(vd.get('out_of_scope', []))} do not. ")
+                            if vd.get('out_of_scope'):
+                                f.write("The out-of-scope domains represent additional external attack surface and ")
+                                f.write("credible phishing pretext, but are excluded from active testing until ")
+                                f.write("authorization is extended to cover them. ")
+                            if vd.get('tenant_default_domain'):
+                                f.write(f"The tenant default domain is {vd['tenant_default_domain']}. ")
+                            f.write("\n\n")
+
+                        if tc.get('desktop_sso_enabled'):
+                            f.write("Tenant configuration disclosure confirmed Seamless single sign-on is enabled, ")
+                            f.write("which indicates an Azure AD Connect deployment synchronizing an on-premises ")
+                            f.write("Active Directory. This establishes an on-premises identity footprint behind the ")
+                            f.write("cloud front and expands the relevant attack surface accordingly. ")
+                        else:
+                            f.write("Tenant configuration disclosure did not advertise Seamless single sign-on. ")
+                        if tc.get('throttle_status') not in (None, 0):
+                            f.write(f"The sign-in endpoint reported active throttling (ThrottleStatus {tc['throttle_status']}), ")
+                            f.write("which should inform pacing and lockout controls for any later authentication phase. ")
+                        if tc.get('boilerplate_text'):
+                            f.write("Custom sign-in boilerplate text is configured on the tenant branding and may ")
+                            f.write("carry help-desk or process detail useful as social-engineering pretext. ")
+                        f.write("\n\n")
+
+                        f.write("Account-agnostic probing of the shared Exchange Online endpoints recorded ")
+                        if las.get('basic_auth_offered'):
+                            f.write("that Basic authentication is still offered at the service layer. Legacy ")
+                            f.write("authentication is therefore not blocked service-side, making a legacy-auth ")
+                            f.write("password phase potentially viable. Actual enforcement remains governed by ")
+                            f.write("per-tenant Conditional Access and must be confirmed with an authenticated ")
+                            f.write("probe before that phase is attempted; this finding is a go or no-go gate, not ")
+                            f.write("proof of policy. ")
+                        else:
+                            f.write("that Basic authentication is not offered at the probed endpoints, indicating ")
+                            f.write("legacy authentication is unlikely to provide a viable path. ")
+                        f.write("\n\n")
+
+                        f.write(f"Hybrid assessment: {hs.get('assessment', 'Unknown')}. ")
+                        if hs.get('mx_routing') == 'onprem_or_thirdparty' and hs.get('mx_hosts'):
+                            f.write(f"Mail exchange records route through non-Microsoft hosts ({', '.join(hs['mx_hosts'])}), ")
+                            f.write("suggesting an on-premises or third-party mail path. ")
+                        if hs.get('autodiscover_routing') == 'onprem' and hs.get('autodiscover_cname'):
+                            f.write(f"Autodiscover resolves to an on-premises target ({hs['autodiscover_cname']}), ")
+                            f.write("consistent with a hybrid Exchange deployment. ")
+                        if hs.get('device_registration'):
+                            f.write("A device-registration record is published, consistent with hybrid Azure AD ")
+                            f.write("join or device registration. ")
+                        f.write("\n\n")
+
                     # Email Security Posture Narrative
                     email_sec = self.results.get('email_security', {})
                     if email_sec:
@@ -7634,6 +8754,41 @@ class ReconAutomation:
                         f.write("federated cloud services. Current vendor advisories should be reviewed against the ")
                         f.write("identified version before active testing.\n\n")
 
+                    # CT Log to Scope Correlation
+                    ct_corr = self.results.get('ct_scope_correlation', {})
+                    if ct_corr and self.ip_ranges:
+                        in_scope_names = ct_corr.get('in_scope', {})
+                        cdn_fronted = ct_corr.get('cdn_fronted', {})
+                        out_of_scope = ct_corr.get('out_of_scope', {})
+                        unresolved = ct_corr.get('unresolved', [])
+                        by_scope_ip = ct_corr.get('by_scope_ip', {})
+
+                        f.write("### Correlating Certificate Transparency With Authorized Scope\n\n")
+                        f.write(f"Certificate transparency names were cross-referenced against the authorized IP ranges ")
+                        f.write(f"to separate confirmed in-scope targets from names that fall outside scope or hide behind a CDN. ")
+                        f.write(f"This produced {len(in_scope_names)} in-scope name(s), {len(cdn_fronted)} CDN-fronted name(s), ")
+                        f.write(f"{len(out_of_scope)} out-of-scope name(s), and {len(unresolved)} unresolved name(s).\n\n")
+
+                        if by_scope_ip:
+                            f.write("The following in-scope IP addresses have certificate transparency names pointing at them. ")
+                            f.write("These are the highest-priority targets for active testing.\n\n")
+                            for ip in sorted(by_scope_ip.keys())[:20]:
+                                names = ', '.join(sorted(by_scope_ip[ip]))
+                                f.write(f"- {ip} <- {names}\n")
+                            if len(by_scope_ip) > 20:
+                                f.write(f"- ... and {len(by_scope_ip) - 20} more\n")
+                            f.write("\n")
+
+                        if cdn_fronted:
+                            f.write("Several certificate transparency names resolve to CDN or hosting provider edge addresses ")
+                            f.write("rather than an in-scope origin. The backing origin may still reside within the authorized ")
+                            f.write("scope, so these names should undergo manual origin discovery before being ruled out.\n\n")
+                            for name, data in sorted(cdn_fronted.items())[:15]:
+                                f.write(f"- {name} ({data.get('provider', 'Unknown')})\n")
+                            if len(cdn_fronted) > 15:
+                                f.write(f"- ... and {len(cdn_fronted) - 15} more\n")
+                            f.write("\n")
+
                     # Subdomain Takeover
                     takeovers = self.results.get('subdomain_takeovers', [])
                     if takeovers:
@@ -7778,25 +8933,36 @@ class ReconAutomation:
                     asn_data = self.results.get('asn_data', {})
 
                     asns = asn_data.get('asn_numbers', [])
+                    hosting = asn_data.get('hosting_providers', [])
                     ip_ranges = asn_data.get('ip_ranges', [])
 
                     if asns:
-                        f.write(f"ASN enumeration identified {len(asns)} autonomous system(s) associated with the organization:\n\n")
+                        f.write(f"ASN enumeration attributed {len(asns)} organization-owned autonomous system(s):\n\n")
                         for asn in asns:
-                            f.write(f"- AS{asn['asn']} - {asn['owner']}\n")
+                            conf = asn.get('ownership_confidence', 'unknown')
+                            f.write(f"- AS{asn['asn']} - {asn['owner']} (ownership confidence {conf})\n")
                         f.write("\n")
+                    else:
+                        f.write("No organization-owned autonomous systems were attributed. ")
+                        if hosting:
+                            f.write("Discovered hosts resolve into cloud, CDN, or shared-hosting space, indicating the external footprint is provider-hosted rather than self-originated.\n\n")
+                        else:
+                            f.write("\n")
+
+                    if hosting:
+                        f.write(f"{len(hosting)} discovered ASN(s) were attributed to hosting or CDN providers and excluded from the organization's infrastructure to avoid attributing shared provider space to the client.\n\n")
 
                     if ip_ranges:
-                        in_scope = [r for r in ip_ranges if r.get('in_scope') or r.get('contains_discovered_ips')]
-                        out_scope = [r for r in ip_ranges if not r.get('in_scope') and not r.get('contains_discovered_ips')]
+                        authorized = [r for r in ip_ranges if r.get('scope') in ('authorized', 'discovered')]
+                        candidate = [r for r in ip_ranges if r.get('scope') == 'candidate']
 
-                        f.write(f"Total IP ranges discovered: {len(ip_ranges)}\n")
-                        f.write(f"- Ranges within authorized scope: {len(in_scope)}\n")
-                        f.write(f"- Ranges outside authorized scope: {len(out_scope)}\n\n")
+                        f.write(f"Total prefixes recorded: {len(ip_ranges)}\n")
+                        f.write(f"- Within authorized scope: {len(authorized)}\n")
+                        f.write(f"- Candidate scope, documented only: {len(candidate)}\n\n")
 
-                        if out_scope:
-                            f.write("Additional IP ranges were identified that belong to the organization but fall outside the authorized testing scope. ")
-                            f.write("These ranges were documented but not tested.\n\n")
+                        if candidate:
+                            f.write("Candidate prefixes are announced by organization-owned ASNs but fall outside the authorized testing scope. ")
+                            f.write("They are documented for the scope conversation and were not tested.\n\n")
 
                     # Cloud Storage Enumeration Section
                     f.write("### Cloud Storage Enumeration\n\n")
@@ -7889,6 +9055,18 @@ class ReconAutomation:
                     else:
                         self.mark_module_status('adfs', 'skipped')
 
+                if self.should_run_module('m365_enrichment'):
+                    if not self.args.skip_m365_enrich:
+                        self.mark_module_status('m365_enrichment', 'in_progress')
+                        try:
+                            self.m365_enrichment()
+                            self.mark_module_status('m365_enrichment', 'complete')
+                        except Exception as e:
+                            self.mark_module_status('m365_enrichment', 'failed', str(e))
+                            self.print_error(f"m365_enrichment failed: {e}")
+                    else:
+                        self.mark_module_status('m365_enrichment', 'skipped')
+
                 if self.should_run_module('email_security'):
                     if not self.args.skip_email_security:
                         self.mark_module_status('email_security', 'in_progress')
@@ -7910,6 +9088,18 @@ class ReconAutomation:
                         self.mark_module_status('dns_enumeration', 'failed', str(e))
                         self.print_error(f"dns_enumeration failed: {e}")
 
+                if self.ip_ranges and self.should_run_module('ct_scope_correlation'):
+                    if not self.args.skip_ct_correlation:
+                        self.mark_module_status('ct_scope_correlation', 'in_progress')
+                        try:
+                            self.ct_scope_correlation()
+                            self.mark_module_status('ct_scope_correlation', 'complete')
+                        except Exception as e:
+                            self.mark_module_status('ct_scope_correlation', 'failed', str(e))
+                            self.print_error(f"ct_scope_correlation failed: {e}")
+                    else:
+                        self.mark_module_status('ct_scope_correlation', 'skipped')
+
                 if not self.ip_ranges and self.should_run_module('post_dns_whois'):
                     self.mark_module_status('post_dns_whois', 'in_progress')
                     try:
@@ -7920,13 +9110,16 @@ class ReconAutomation:
                         self.print_error(f"post_dns_whois failed: {e}")
 
                 if self.should_run_module('technology_stack'):
-                    self.mark_module_status('technology_stack', 'in_progress')
-                    try:
-                        self.technology_stack_identification()
-                        self.mark_module_status('technology_stack', 'complete')
-                    except Exception as e:
-                        self.mark_module_status('technology_stack', 'failed', str(e))
-                        self.print_error(f"technology_stack failed: {e}")
+                    if not self.args.skip_techstack:
+                        self.mark_module_status('technology_stack', 'in_progress')
+                        try:
+                            self.technology_stack_identification()
+                            self.mark_module_status('technology_stack', 'complete')
+                        except Exception as e:
+                            self.mark_module_status('technology_stack', 'failed', str(e))
+                            self.print_error(f"technology_stack failed: {e}")
+                    else:
+                        self.mark_module_status('technology_stack', 'skipped')
 
                 if self.should_run_module('email_harvesting'):
                     self.mark_module_status('email_harvesting', 'in_progress')
@@ -8159,8 +9352,8 @@ class ReconAutomation:
     def init_state(self):
                 """Initialize state tracking structure (multi-domain, client-level)"""
                 per_domain_modules = [
-                    'scope_validation', 'm365_tenant', 'adfs', 'email_security',
-                    'dns_enumeration', 'post_dns_whois', 'technology_stack',
+                    'scope_validation', 'm365_tenant', 'm365_enrichment', 'adfs', 'email_security',
+                    'dns_enumeration', 'ct_scope_correlation', 'post_dns_whois', 'technology_stack',
                     'email_harvesting', 'linkedin_enumeration', 'breach_database_check',
                     'github_secret_scanning', 'asn_enumeration',
                     'subdomain_takeover_detection', 's3_bucket_enumeration',
@@ -8469,6 +9662,7 @@ Examples:
     python3 quick_recon.py -d example.com -c "Acme Corp" --email-only
     python3 quick_recon.py -d example.com -c "Acme Corp" --m365-only
     python3 quick_recon.py -d example.com -c "Acme Corp" --adfs-only
+    python3 quick_recon.py -d example.com -c "Acme Corp" --m365-enrich-only
     python3 quick_recon.py -d example.com -c "Acme Corp" --email-security-only
 
   LinkedIn delay modes (avoid rate limits):
@@ -8501,9 +9695,13 @@ Examples:
     parser.add_argument('--skip-github', action='store_true', help='Skip GitHub secret scanning')
     parser.add_argument('--skip-asn', action='store_true', help='Skip ASN enumeration')
     parser.add_argument('--skip-subdomain-takeover', action='store_true', help='Skip subdomain takeover detection')
+    parser.add_argument('--skip-ct-correlation', action='store_true', help='Skip CT-to-scope correlation (requires -i)')
     parser.add_argument('--skip-m365', action='store_true', help='Skip M365/Azure AD tenant attribution')
     parser.add_argument('--skip-adfs', action='store_true', help='Skip ADFS endpoint discovery')
+    parser.add_argument('--skip-m365-enrich', action='store_true', help='Skip M365/Azure AD enrichment (domain enum, tenant config, legacy-auth surface, hybrid signal)')
+    parser.add_argument('--skip-techstack', action='store_true', help='Skip technology stack identification')
     parser.add_argument('--skip-email-security', action='store_true', help='Skip email security posture check (SPF/DKIM/DMARC)')
+    parser.add_argument('--resolvers', default=None, help='Comma-separated DNS resolvers for SPF/DKIM/DMARC lookups (default: 1.1.1.1,8.8.8.8,9.9.9.9)')
     parser.add_argument('--skip-osint', action='store_true', help='Skip all OSINT modules (GitHub, LinkedIn)')
     parser.add_argument('--linkedin-max-results', type=int, default=100, help='Maximum LinkedIn employee results to fetch (default: 100)')
     parser.add_argument('--linkedin-mode', choices=['fast', 'normal', 'paranoid'], default='normal', help='LinkedIn delay mode: fast (testing only, high lockout risk), normal (default, human-like delays), paranoid (slower, for sensitive engagements)')
@@ -8523,6 +9721,7 @@ Examples:
     parser.add_argument('--techstack-only', action='store_true', help='Run only technology stack identification')
     parser.add_argument('--m365-only', action='store_true', help='Run only M365 tenant attribution')
     parser.add_argument('--adfs-only', action='store_true', help='Run only ADFS endpoint discovery (runs M365 first)')
+    parser.add_argument('--m365-enrich-only', action='store_true', help='Run only M365/Azure AD enrichment (runs M365 first)')
     parser.add_argument('--email-security-only', action='store_true', help='Run only email security posture check')
 
     args = parser.parse_args()
@@ -8570,6 +9769,7 @@ Examples:
         'techstack_only': ('Technology stack identification', 'technology_stack_identification', 'technology_stack'),
         'm365_only': ('M365 tenant attribution', 'm365_tenant_attribution', 'm365_tenant'),
         'adfs_only': ('ADFS endpoint discovery', 'adfs_endpoint_discovery', 'adfs'),
+        'm365_enrich_only': ('M365 enrichment', 'm365_enrichment', 'm365_enrichment'),
         'email_security_only': ('Email security posture check', 'email_security_posture', 'email_security'),
     }
 
@@ -8627,6 +9827,11 @@ Examples:
         # ADFS discovery needs M365 attribution first
         if mode_name == 'adfs_only':
             print(f"{Colors.OKCYAN}[i] Running M365 tenant attribution first (required for ADFS discovery){Colors.ENDC}")
+            recon.m365_tenant_attribution()
+
+        # Enrichment needs M365 attribution first
+        if mode_name == 'm365_enrich_only':
+            print(f"{Colors.OKCYAN}[i] Running M365 tenant attribution first (required for enrichment){Colors.ENDC}")
             recon.m365_tenant_attribution()
 
         try:
